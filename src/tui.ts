@@ -1,4 +1,6 @@
 import { appendFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { Plugin } from "@opencode/plugin/tui";
 import type { PublicProfile } from "./profiles.js";
 import { SshRpc } from "./rpc.js";
@@ -8,7 +10,7 @@ function debugLog(message: string): void {
   const target = process.env.OPENCODE_SSH_TUI_DEBUG;
   if (!target) return;
   const file =
-    target === "1" ? "D:/codefile/maincode/opencode-ssh/tui-debug.log" : target;
+    target === "1" ? path.join(tmpdir(), "opencode-ssh-tui.log") : target;
   try {
     appendFileSync(file, `${new Date().toISOString()} ${message}\n`);
   } catch {

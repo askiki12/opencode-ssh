@@ -47,10 +47,6 @@
   - 菜单打开期间 agent 或其他窗口连接/断开，显示不会更新。
   - 影响仅为显示层，实际连接由 `ConnectionManager` 复用兜底。
 
-- [ ] **TUI 调试日志收尾**
-  - `src/tui.ts` 的 `debugLog` 硬编码了 `D:/codefile/maincode/opencode-ssh/tui-debug.log`。
-  - 需要改成基于 `dataDir` 或环境变量的路径，或者确认不再需要后整体删除。
-
 ### P2（低优先级）
 
 - [ ] **`fleet_exec`：多机并发执行**
@@ -58,10 +54,6 @@
   - 前置：profile 目前没有 tag/分组，需要扩展数据模型和 UI。
   - 最小版本：`profile_ids[] + parallel + stop_on_error`，不做 tag/rolling。
   - 只有机器数量上来（>5）或需要统一审计时才值得做；当前用现有工具循环即可。
-
-- [ ] **job 的 Docker 容器级跟踪**
-  - 当前 job 只跟踪宿主机进程：`docker run -d` 立即返回、`docker exec` 不随 job 停止、停止前台 `docker run` 也可能留下容器（真实验证：容器仍在 `Up`）。
-  - 预期：显式 `container` 参数，stop 时同时 `docker stop`，status 映射容器状态。需要额外协议和测试，按需求再做。
 
 - [ ] **`ssh_patch`（统一 diff 应用）**
   - 需要远端有 `patch` 或 `git apply`；建议先 `--dry-run` 再执行。
@@ -75,11 +67,6 @@
   - 现在是“accept-new vs 其他” + “strict vs insecure” 两次确认，不是真正的三选项菜单。
   - 原因：select 对话框带过滤输入，用户不希望选择策略还要打字。
   - 预期：如果要单选，需要写自定义 JSX 对话框，一次展示 `accept-new` / `strict` / `insecure`。
-
-- [ ] **文件、密钥和 known_hosts 没有备份/迁移机制**
-  - 涉及 `%APPDATA%\opencode-ssh\master.key`、private key 路径、`known_hosts.json`。
-  - 当前换机器或重装需要手动重新录入 profile 和主机指纹。
-  - 预期：至少提供导出/导入说明；更高优先级方案是迁移到 `ctx.storage` 并支持加密导出。
 
 ### P3（最低）
 
@@ -121,3 +108,4 @@
 - 2026-11-13：文件工具在真实主机验证通过：读写、唯一匹配与歧义拒绝、覆盖保护、`glob`（find 回退）、`grep`（grep 回退）、二进制检测、截断、删除 `dry_run`/实际删除、上传下载。
 - 2026-11-13：新增长任务工具 `ssh_job_start` / `ssh_job_status` / `ssh_job_stop`：远端 `~/.opencode-ssh/jobs/<job_id>/` 为唯一状态源，`setsid` + 进程组终止，`stopped_at` 标记，支持列表与日志尾部。真实主机验证：启动 400ms 返回、运行/完成/停止状态、退出码、日志、清理。Docker 容器不会随 job 停止（已记录限制）。
 - 2026-11：`npm run typecheck`、`npm run test:smoke`、`npm run test:tui` 通过。
+- 2026-11-13：TUI 调试日志不再硬编码项目路径：`OPENCODE_SSH_TUI_DEBUG=1` 写入系统临时目录，设为其他值则按路径写入。
