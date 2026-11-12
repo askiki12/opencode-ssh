@@ -53,6 +53,12 @@
 
 ### P2（低优先级）
 
+- [ ] **`fleet_exec`：多机并发执行**
+  - 价值：一次调用替代 N 次工具调用；并发上限、`stop_on_error`、rolling 分批、每台独立结果；按 tag 选择可减少提示体积。
+  - 前置：profile 目前没有 tag/分组，需要扩展数据模型和 UI。
+  - 最小版本：`profile_ids[] + parallel + stop_on_error`，不做 tag/rolling。
+  - 只有机器数量上来（>5）或需要统一审计时才值得做；当前用现有工具循环即可。
+
 - [ ] **job 的 Docker 容器级跟踪**
   - 当前 job 只跟踪宿主机进程：`docker run -d` 立即返回、`docker exec` 不随 job 停止、停止前台 `docker run` 也可能留下容器（真实验证：容器仍在 `Up`）。
   - 预期：显式 `container` 参数，stop 时同时 `docker stop`，status 映射容器状态。需要额外协议和测试，按需求再做。
