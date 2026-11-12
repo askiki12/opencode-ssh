@@ -364,7 +364,7 @@ npm install
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugins": ["D:/codefile/maincode/opencode-ssh"]
+  "plugins": ["C:/Users/<you>/code/opencode-ssh"]
 }
 ```
 
@@ -384,9 +384,9 @@ npm install
 {
   "plugins": [
     {
-      "package": "D:/codefile/maincode/opencode-ssh",
+      "package": "C:/Users/<you>/code/opencode-ssh",
       "options": {
-        "dataDir": "D:/secrets/opencode-ssh",
+        "dataDir": "C:/Users/<you>/AppData/Roaming/opencode-ssh",
         "idleTimeoutMs": 1800000,
         "maxOutputBytes": 262144,
         "connectTimeoutMs": 20000,

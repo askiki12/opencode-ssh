@@ -6,3 +6,13 @@ tui-debug.log
 .env.*
 !.env.example
 .DS_Store
+
+# Local plugin configuration (machine specific)
+opencode.json
+
+# Plugin secrets and runtime data (should live outside the repo)
+master.key
+master.salt
+known_hosts.json
+profiles.json
+*.pem

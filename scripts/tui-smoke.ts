@@ -18,7 +18,7 @@ let lastSelectOptions: any;
 let lastConnectInput: any;
 
 const context = {
-  location: { directory: "D:/codefile/maincode/opencode-ssh" },
+  location: { directory: "C:/work/opencode-ssh" },
   keymap: {
     layer: (factory: () => { commands: Command[] }) => {
       for (const command of factory().commands) {
@@ -122,7 +122,7 @@ async function main() {
   assert.ok(alerts.includes("没有活跃连接。"));
   assert.equal(
     lastRpcOptions?.location?.directory,
-    "D:/codefile/maincode/opencode-ssh",
+    "C:/work/opencode-ssh",
   );
 
   reset();
