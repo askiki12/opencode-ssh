@@ -1095,7 +1095,7 @@ export function createSshTools(
         "Use this for tasks that outlive one tool call (training, builds, migrations) instead of raising ssh_exec timeout_ms. " +
         "The process survives disconnect and OpenCode restarts. " +
         "Environment variables go inline in the command (export FOO=bar && ...). " +
-        "Run a foreground command: if it backgrounds itself (nohup, &, docker run -d), the job finishes immediately and tracks only the launcher. " +
+        "Run a foreground command only: if the command backgrounds itself (nohup, &, docker run -d), do not use ssh_job_start; the job would finish immediately and track only the launcher. Use ssh_exec and manage that process yourself instead. " +
         "Only the host process is tracked; containers keep their own lifecycle, so decide separately whether to stop or leave them running. " +
         "Inspect with ssh_job_status, terminate with ssh_job_stop, clean up with ssh_remove on job_dir. POSIX remotes only.",
       input: JOB_START_INPUT,
