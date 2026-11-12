@@ -23,25 +23,6 @@
 
 ### P1
 
-- [ ] **长任务模型：job start / status / logs / stop / list / cleanup**
-  - 背景：`ssh_exec` 的 `timeout_ms` 是单次调用等待上限，无法承载数小时的训练/量化任务；调大只是拖住 channel，断线就丢结果。
-  - 目标：把任务生命周期从 SSH channel 里解耦，工具调用只做短请求。
-  - 建议工具（名字待定，倾向独立工具而不是 `action` 参数，模型更容易选对）：
-    - `ssh_job_start`：`nohup`/`setsid` 后台启动，立即返回 `job_id`、pid、日志路径
-    - `ssh_job_status`：`kill -0` 判断存活 + `ps` 输出运行时长和退出码
-    - `ssh_job_logs`：`tail -n` / `tail -c` 取日志，复用 `max_output_bytes` 截断
-    - `ssh_job_stop`：先 `SIGTERM`，宽限后 `SIGKILL`
-    - `ssh_job_list`：列出该主机上由插件创建的任务
-    - `ssh_job_cleanup`：删除已结束任务的目录和元数据
-  - 远端布局：`~/.opencode-ssh/jobs/<job_id>/` 存 `meta.json`（命令、cwd、pid、启动时间、日志路径）和 `output.log`，目录权限 `0700`。
-  - 关键点：
-    - 启动命令必须脱离 channel 和 TTY，避免断线时收到 SIGHUP；
-    - 不假设 systemd，直接 `nohup sh -c '...' &`；
-    - `job_id` 与 `ssh_id` 解耦，连接重来后仍可查；
-    - 日志可能含敏感信息，不做明文回传以外的额外复制。
-  - 与 `timeout_ms` 的关系：`start` 结束即返回，`timeout_ms` 只用于短操作；不再需要 `timeout -k` 补丁。
-  - 限制：仅 POSIX 远端；Windows 远端不支持。需要新增 smoke 测试覆盖 start/status/logs/stop。
-
 - [ ] **补充真实服务器回归**
   - 现有 `scripts/smoke.ts`、`scripts/tui-smoke.ts` 都基于本地 ssh2 测试服务器。
   - 已在真实 Linux 主机（root + 私钥）手工验证：
@@ -71,6 +52,10 @@
   - 需要改成基于 `dataDir` 或环境变量的路径，或者确认不再需要后整体删除。
 
 ### P2（低优先级）
+
+- [ ] **job 的 Docker 容器级跟踪**
+  - 当前 job 只跟踪宿主机进程：`docker run -d` 立即返回、`docker exec` 不随 job 停止、停止前台 `docker run` 也可能留下容器（真实验证：容器仍在 `Up`）。
+  - 预期：显式 `container` 参数，stop 时同时 `docker stop`，status 映射容器状态。需要额外协议和测试，按需求再做。
 
 - [ ] **`ssh_patch`（统一 diff 应用）**
   - 需要远端有 `patch` 或 `git apply`；建议先 `--dry-run` 再执行。
@@ -128,4 +113,5 @@
 - 2026-11-13：真实 Linux 主机（root）手工回归通过：私钥与密码两种认证、基础执行、`cwd`/`env`、非 0 退出码、输出截断、sudo、profile 复用、`force_new`、失效 `ssh_id`、执行中断线报错、后台 job 模式。
 - 2026-11-13：新增远程文件工具 `ssh_read` / `ssh_write` / `ssh_edit` / `ssh_glob` / `ssh_grep` / `ssh_remove` / `ssh_transfer`；每条连接复用 SFTP session；写/编辑采用临时文件 + 原子替换，并处理 OpenSSH SFTP v3 不允许覆盖 rename 的问题（posix-rename 扩展 + 备份回滚兜底）。
 - 2026-11-13：文件工具在真实主机验证通过：读写、唯一匹配与歧义拒绝、覆盖保护、`glob`（find 回退）、`grep`（grep 回退）、二进制检测、截断、删除 `dry_run`/实际删除、上传下载。
+- 2026-11-13：新增长任务工具 `ssh_job_start` / `ssh_job_status` / `ssh_job_stop`：远端 `~/.opencode-ssh/jobs/<job_id>/` 为唯一状态源，`setsid` + 进程组终止，`stopped_at` 标记，支持列表与日志尾部。真实主机验证：启动 400ms 返回、运行/完成/停止状态、退出码、日志、清理。Docker 容器不会随 job 停止（已记录限制）。
 - 2026-11：`npm run typecheck`、`npm run test:smoke`、`npm run test:tui` 通过。

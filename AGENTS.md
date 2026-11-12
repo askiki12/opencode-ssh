@@ -64,6 +64,21 @@ Rules that matter:
 - `ssh_grep` / `ssh_glob` need `rg`, `grep`, or `find` on the remote. If both `rg` and `grep` are missing, tell the user and offer to install ripgrep via `ssh_exec` (ask before installing). Never fall back to reading every file over SFTP.
 - Do not download large files just to inspect them; use `ssh_read` with `offset` / `limit`.
 
+## Long-running jobs
+
+Use the job tools when a task should outlive one tool call (training, builds, migrations, long test suites):
+
+- `ssh_job_start` returns `job_id`, `pid`, `job_dir`, and the log path. It returns immediately; it does not wait for the command.
+- Do **not** raise `ssh_exec`'s `timeout_ms` to hours. That holds a channel open and loses the result on disconnect.
+- `ssh_job_status` with `job_id` shows state, exit code, elapsed time; add `log_lines` to tail output. Call it without `job_id` to list all jobs.
+- States: `running`, `finished`, `stopped`, `lost` (process gone, no exit code), `corrupt`.
+- `ssh_job_stop` sends SIGTERM, then SIGKILL to the process group. It refuses when the pid no longer belongs to the job.
+- Clean up finished jobs with `ssh_remove` on `job_dir` (use `dry_run` first).
+- Environment variables go inline: `export FOO=bar && python train.py`.
+- Jobs survive disconnect and reconnect; state lives under `~/.opencode-ssh/jobs/` on the remote.
+- Docker is not tracked at container level: `docker run -d` returns immediately, `docker exec` does not stop the container, and stopping a foreground `docker run` may leave the container running. Name the container and use `docker stop` when needed.
+- POSIX remotes only.
+
 ## Security
 
 - Do not put passwords, private key passphrases, or sudo passwords in user-facing summaries.

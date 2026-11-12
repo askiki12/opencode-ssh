@@ -16,6 +16,7 @@ import type {
   ConnectionManager,
   ExecResult,
 } from "../ssh/manager.js";
+import type { JobInfo, JobService } from "../ssh/jobs.js";
 import type { SearchService } from "../ssh/search.js";
 import { errorMessage } from "../util.js";
 
@@ -43,6 +44,7 @@ export interface ToolDependencies {
   profiles: ProfileStore;
   config: ResolvedConfig;
   search: SearchService;
+  jobs: JobService;
   assertPermission?: (request: SshPermissionRequest) => Promise<void>;
 }
 
@@ -387,6 +389,72 @@ const TRANSFER_INPUT = {
     },
   },
   required: ["ssh_id", "direction", "local_path", "remote_path"],
+  additionalProperties: false,
+} as const;
+
+const JOB_START_INPUT = {
+  type: "object",
+  properties: {
+    ssh_id: {
+      type: "string",
+      description: "Connection id returned by ssh_connect.",
+    },
+    command: {
+      type: "string",
+      description:
+        "Shell command to run detached. Set environment variables inline, for example: export FOO=bar && python train.py. Docker works as a normal command (docker run / docker exec).",
+    },
+    name: {
+      type: "string",
+      description: "Optional short label shown by ssh_job_status.",
+    },
+    cwd: {
+      type: "string",
+      description:
+        "Working directory for the command. Absolute or ~/...; defaults to the remote home directory.",
+    },
+  },
+  required: ["ssh_id", "command"],
+  additionalProperties: false,
+} as const;
+
+const JOB_STATUS_INPUT = {
+  type: "object",
+  properties: {
+    ssh_id: {
+      type: "string",
+      description: "Connection id returned by ssh_connect.",
+    },
+    job_id: {
+      type: "string",
+      description:
+        "Job to inspect. Omit to list all jobs created by this plugin for the current user.",
+    },
+    log_lines: {
+      type: "integer",
+      minimum: 1,
+      maximum: 500,
+      description:
+        "Include the last N lines of output.log. Only used when job_id is provided.",
+    },
+  },
+  required: ["ssh_id"],
+  additionalProperties: false,
+} as const;
+
+const JOB_STOP_INPUT = {
+  type: "object",
+  properties: {
+    ssh_id: {
+      type: "string",
+      description: "Connection id returned by ssh_connect.",
+    },
+    job_id: {
+      type: "string",
+      description: "Job returned by ssh_job_start.",
+    },
+  },
+  required: ["ssh_id", "job_id"],
   additionalProperties: false,
 } as const;
 
@@ -1022,6 +1090,135 @@ export function createSshTools(
     },
 
     {
+      name: "job_start",
+      description:
+        "Start a long-running remote command detached from the SSH channel and return a job_id. " +
+        "Use this for tasks that outlive one tool call (training, builds, migrations) instead of raising exec timeout_ms. " +
+        "The process survives disconnect and OpenCode restarts. " +
+        "Environment variables go inline in the command (export FOO=bar && ...). " +
+        "Docker works as a normal command, but the job tracks the host process only: docker run -d returns immediately, " +
+        "docker exec does not stop the container, and stopping a foreground docker run may leave the container running. " +
+        "Give containers an explicit --name and stop them with docker stop when needed. " +
+        "Inspect with ssh_job_status, terminate with ssh_job_stop, clean up with ssh_remove on job_dir. POSIX remotes only.",
+      input: JOB_START_INPUT,
+      options: { namespace: "ssh", codemode: true },
+      execute: async (raw, context) => {
+        const input = asRecord(raw);
+        const sshId = requireString(input.ssh_id, "ssh_id");
+        await assertHostPermission(dependencies, context, sshId);
+
+        const result = await dependencies.jobs.start({
+          sshId,
+          command: requireString(input.command, "command"),
+          ...(input.name !== undefined
+            ? { name: requireString(input.name, "name") }
+            : {}),
+          ...(input.cwd !== undefined
+            ? { cwd: requireString(input.cwd, "cwd") }
+            : {}),
+        });
+
+        return {
+          content: [
+            `Job started: ${result.jobId}`,
+            ...(result.name !== undefined ? [`name: ${result.name}`] : []),
+            `pid: ${result.pid}`,
+            `job_dir: ${result.jobDir}`,
+            `log: ${result.logPath}`,
+            "",
+            "Use ssh_job_status to check progress and ssh_job_stop to terminate it.",
+          ].join("\n"),
+          metadata: { ...result },
+        };
+      },
+    },
+
+    {
+      name: "job_status",
+      description:
+        "Check a job started by ssh_job_start, or list all jobs when job_id is omitted. " +
+        "States: starting, running, finished (has exit_code), lost (process gone without exit_code), corrupt. " +
+        "Pass log_lines to include the tail of output.log. " +
+        "Finished jobs keep their logs until you remove their job_dir with ssh_remove.",
+      input: JOB_STATUS_INPUT,
+      options: { namespace: "ssh", codemode: true },
+      execute: async (raw) => {
+        const input = asRecord(raw);
+        const sshId = requireString(input.ssh_id, "ssh_id");
+        const jobId = optionalString(input.job_id);
+        const logLines =
+          input.log_lines === undefined
+            ? 0
+            : requireInteger(input.log_lines, "log_lines");
+
+        const result = await dependencies.jobs.status(sshId, jobId, logLines);
+        if (Array.isArray(result)) {
+          return {
+            content: formatJobList(result),
+            metadata: { count: result.length },
+          };
+        }
+        return {
+          content: formatJobInfo(result),
+          metadata: {
+            jobId: result.jobId,
+            state: result.state,
+            pid: result.pid,
+            exitCode: result.exitCode,
+            jobDir: result.jobDir,
+          },
+        };
+      },
+    },
+
+    {
+      name: "job_stop",
+      description:
+        "Terminate a running job with SIGTERM, then SIGKILL after a short grace period. " +
+        "Kills the whole process group when available. Refuses to signal a pid whose command line " +
+        "does not belong to the job, which protects against pid reuse. " +
+        "Finished jobs are reported without doing anything.",
+      input: JOB_STOP_INPUT,
+      options: { namespace: "ssh", codemode: true },
+      execute: async (raw, context) => {
+        const input = asRecord(raw);
+        const sshId = requireString(input.ssh_id, "ssh_id");
+        await assertHostPermission(dependencies, context, sshId);
+
+        const result = await dependencies.jobs.stop(
+          sshId,
+          requireString(input.job_id, "job_id"),
+        );
+
+        const lines: string[] = [];
+        switch (result.outcome) {
+          case "stopped":
+            lines.push(`Stopped job ${result.jobId} (pid ${result.pid}).`);
+            break;
+          case "already-finished":
+            lines.push(
+              `Job ${result.jobId} already finished with exit code ${result.exitCode}.`,
+            );
+            break;
+          case "not-running":
+            lines.push(
+              `Job ${result.jobId} is no longer running and has no exit code; inspect its job_dir or remove it.`,
+            );
+            break;
+          case "mismatch":
+            lines.push(
+              `Refused to stop job ${result.jobId}: pid ${result.pid} does not belong to the job directory.`,
+            );
+            break;
+        }
+        return {
+          content: lines.join("\n"),
+          metadata: { ...result },
+        };
+      },
+    },
+
+    {
       name: "profile_add",
       description:
         "Save a reusable SSH profile. Passwords and passphrases are encrypted at rest with AES-256-GCM. " +
@@ -1311,6 +1508,66 @@ async function assertPathPermission(
     toolCallID: context.id,
     resource: `${connection.user}@${connection.host}:${target}`,
   });
+}
+
+async function assertHostPermission(
+  dependencies: ToolDependencies,
+  context: ExecuteContext,
+  sshId: string,
+): Promise<void> {
+  if (!dependencies.assertPermission) return;
+  const connection = dependencies.manager.getInfo(sshId);
+  await dependencies.assertPermission({
+    sessionID: context.sessionID,
+    agent: context.agent,
+    messageID: context.messageID,
+    toolCallID: context.id,
+    resource: `${connection.user}@${connection.host}:${connection.port}`,
+  });
+}
+
+function formatJobInfo(info: JobInfo): string {
+  const lines = [
+    `job: ${info.jobId}`,
+    ...(info.name !== undefined ? [`name: ${info.name}`] : []),
+    `state: ${info.state}`,
+    ...(info.pid !== undefined ? [`pid: ${info.pid}`] : []),
+    `exit_code: ${info.exitCode === undefined ? "(none)" : info.exitCode}`,
+    ...(info.startedAt !== undefined ? [`started_at: ${info.startedAt}`] : []),
+    ...(info.elapsedMs !== undefined
+      ? [`elapsed: ${formatDuration(info.elapsedMs)}`]
+      : []),
+    ...(info.command !== undefined ? [`command: ${info.command}`] : []),
+    `job_dir: ${info.jobDir}`,
+    `log: ${info.logPath}`,
+  ];
+
+  if (info.logUnavailable === true) {
+    lines.push("", "[logs] unavailable");
+  } else if (info.log !== undefined) {
+    lines.push("", "[last lines]", info.log.length > 0 ? info.log : "(empty)");
+  }
+  if (info.state === "finished" || info.state === "stopped" || info.state === "lost") {
+    lines.push(
+      "",
+      "[note] Remove the job directory with ssh_remove when the logs are no longer needed.",
+    );
+  }
+  return lines.join("\n");
+}
+
+function formatJobList(jobs: JobInfo[]): string {
+  if (jobs.length === 0) return "No jobs found.";
+  const lines = [`jobs: ${jobs.length}`];
+  for (const job of jobs) {
+    const bits = [job.jobId, job.state];
+    if (job.name !== undefined) bits.push(`name=${job.name}`);
+    if (job.exitCode !== undefined) bits.push(`exit=${job.exitCode}`);
+    if (job.startedAt !== undefined) bits.push(`started=${job.startedAt}`);
+    bits.push(job.jobDir);
+    lines.push(`- ${bits.join("  ")}`);
+  }
+  return lines.join("\n");
 }
 
 function formatReadResult(result: ReadRemoteFileResult): string {

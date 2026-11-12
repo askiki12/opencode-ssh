@@ -25,7 +25,14 @@ import {
   transferPath,
   writeRemoteFile,
 } from "../src/ssh/files.js";
-import { ConnectionManager } from "../src/ssh/manager.js";
+import {
+  JobService,
+  buildJobScript,
+  buildLaunchCommand,
+  type JobConnections,
+  type JobInfo,
+} from "../src/ssh/jobs.js";
+import { ConnectionManager, type ExecResult } from "../src/ssh/manager.js";
 import { globToRegExp, SearchService } from "../src/ssh/search.js";
 import { createSshTools, type ToolDefinition } from "../src/tools/definitions.js";
 import { createFakeSftp } from "./fake-sftp.js";
@@ -332,6 +339,78 @@ async function main() {
     rmSync(fileRoot, { recursive: true, force: true });
   }
 
+  const jobRoot = mkdtempSync(path.join(tmpdir(), "opencode-ssh-jobs-"));
+  try {
+    const harness = new FakeJobConnections(jobRoot);
+    const jobs = new JobService(harness);
+
+    const script = buildJobScript(
+      "echo hi",
+      "/home/tester/.opencode-ssh/jobs/job_ab12cd34",
+      "/tmp",
+    );
+    assert.ok(script.includes("echo $$ >"));
+    assert.ok(script.includes("echo $? >"));
+    assert.ok(script.includes("date +%s >"));
+    const launch = buildLaunchCommand("/home/tester/.opencode-ssh/jobs/job_ab12cd34");
+    assert.ok(launch.includes("setsid"));
+    assert.ok(launch.includes("echo $!"));
+
+    const started = await jobs.start({
+      sshId: "ssh_test",
+      command: "sleep 100",
+      name: "train",
+    });
+    assert.match(started.jobId, /^job_[0-9a-f]{12}$/);
+    assert.equal(started.pid, 4242);
+    assert.equal(started.logPath, `${started.jobDir}/output.log`);
+
+    const running = await jobs.status("ssh_test", started.jobId, 2);
+    assert.equal(Array.isArray(running), false);
+    const runningInfo = running as JobInfo;
+    assert.equal(runningInfo.state, "running");
+    assert.equal(runningInfo.name, "train");
+    assert.match(runningInfo.log ?? "", /log-1/);
+
+    const listed = await jobs.status("ssh_test", undefined, 0);
+    assert.equal(Array.isArray(listed), true);
+    assert.equal((listed as JobInfo[]).length, 1);
+    assert.equal((listed as JobInfo[])[0]?.state, "running");
+
+    harness.writeExit(started.jobDir, 0);
+    const finished = (await jobs.status("ssh_test", started.jobId, 0)) as JobInfo;
+    assert.equal(finished.state, "finished");
+    assert.equal(finished.exitCode, 0);
+
+    const stopFinished = await jobs.stop("ssh_test", started.jobId);
+    assert.equal(stopFinished.outcome, "already-finished");
+
+    harness.clearExit(started.jobDir);
+    harness.alive = false;
+    const lost = (await jobs.status("ssh_test", started.jobId, 0)) as JobInfo;
+    assert.equal(lost.state, "lost");
+    const stopLost = await jobs.stop("ssh_test", started.jobId);
+    assert.equal(stopLost.outcome, "not-running");
+
+    harness.alive = true;
+    harness.stopAnswer = "mismatch";
+    const mismatch = await jobs.stop("ssh_test", started.jobId);
+    assert.equal(mismatch.outcome, "mismatch");
+
+    harness.stopAnswer = "stopped";
+    const stopped = await jobs.stop("ssh_test", started.jobId);
+    assert.equal(stopped.outcome, "stopped");
+    const stoppedInfo = (await jobs.status("ssh_test", started.jobId, 0)) as JobInfo;
+    assert.equal(stoppedInfo.state, "stopped");
+
+    await assert.rejects(
+      jobs.status("ssh_test", "job_zzzz", 0),
+      /Invalid job_id/,
+    );
+  } finally {
+    rmSync(jobRoot, { recursive: true, force: true });
+  }
+
   const config = resolveConfig(
     { dataDir, connectTimeoutMs: 3000, execTimeoutMs: 5000 },
     dataDir,
@@ -486,6 +565,7 @@ async function main() {
       profiles,
       config,
       search: new SearchService(manager),
+      jobs: new JobService(manager),
       assertPermission: async (request) => {
         permissionRequests.push({ resource: request.resource });
       },
@@ -750,5 +830,84 @@ async function captureError(run: () => Promise<unknown>): Promise<string> {
     return "";
   } catch (error) {
     return error instanceof Error ? error.message : String(error);
+  }
+}
+
+/**
+ * Simulates the remote side of a job: the launch command writes pid/started_at,
+ * probes report liveness, and stop returns a scripted outcome.
+ */
+class FakeJobConnections implements JobConnections {
+  private readonly sftpStore;
+  alive = true;
+  stopAnswer: "stopped" | "not-running" | "mismatch" = "stopped";
+  readonly now = Math.floor(Date.now() / 1_000);
+
+  constructor(private readonly root: string) {
+    this.sftpStore = createFakeSftp(root);
+  }
+
+  sftp() {
+    return Promise.resolve(this.sftpStore);
+  }
+
+  homeDir() {
+    return Promise.resolve("/home/tester");
+  }
+
+  exec(input: {
+    sshId: string;
+    command: string;
+    timeoutMs?: number;
+    maxOutputBytes?: number;
+  }): Promise<ExecResult> {
+    const result = (stdout: string, exitCode = 0): ExecResult => ({
+      sshId: input.sshId,
+      exitCode,
+      stdout,
+      stderr: "",
+      durationMs: 1,
+      truncated: false,
+    });
+
+    const command = input.command;
+    if (command.startsWith("(command -v setsid")) {
+      const match = /sh '([^']+)'/.exec(command);
+      const script = match?.[1] ?? "";
+      const local = this.toLocal(path.posix.dirname(script));
+      writeFileSync(path.join(local, "pid"), "4242\n");
+      writeFileSync(path.join(local, "started_at"), `${this.now}\n`);
+      return Promise.resolve(result("4242\n"));
+    }
+    if (command.includes("tail -n")) {
+      return Promise.resolve(result("log-1\nlog-2\n"));
+    }
+    if (command.includes('echo "now=')) {
+      return Promise.resolve(
+        result(
+          this.alive
+            ? `now=${this.now}\n4242=alive\n4242=match\n`
+            : `now=${this.now}\n4242=dead\n`,
+        ),
+      );
+    }
+    if (command.includes("kill -TERM")) {
+      return Promise.resolve(
+        result(this.alive ? `${this.stopAnswer}\n` : "not-running\n"),
+      );
+    }
+    return Promise.resolve(result(""));
+  }
+
+  writeExit(jobDir: string, code: number): void {
+    writeFileSync(path.join(this.toLocal(jobDir), "exit_code"), `${code}\n`);
+  }
+
+  clearExit(jobDir: string): void {
+    rmSync(path.join(this.toLocal(jobDir), "exit_code"), { force: true });
+  }
+
+  private toLocal(remote: string): string {
+    return path.join(this.root, `.${remote}`);
   }
 }

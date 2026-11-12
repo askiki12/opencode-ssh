@@ -282,6 +282,38 @@ sudo 示例（需要 profile 或连接上保存了 `sudo_password`）：
 - `ssh_grep` / `ssh_glob` 依赖远端有 `rg`、`grep` 或 `find`；都没有时 `ssh_grep` 会明确报错，并提示可以用 `ssh_exec` 安装 ripgrep。
 - 不建议用 `ssh_exec cat` 读大文件，也不建议把大文件传到本地再搜索。
 
+### 2.10 长任务工具
+
+| 工具 | 用途 |
+| --- | --- |
+| `ssh_job_start` | 后台启动命令，立即返回 `job_id`、pid、job 目录和日志路径 |
+| `ssh_job_status` | 查询单个 job；省略 `job_id` 时列出全部 job；`log_lines` 取日志尾部 |
+| `ssh_job_stop` | 先 `SIGTERM`，宽限后 `SIGKILL`，按进程组终止 |
+
+状态：
+
+- `starting`：已创建目录，进程尚未写入 pid；
+- `running`：进程存活且命令行匹配 job 目录；
+- `finished`：有 `exit_code`；
+- `stopped`：被 `ssh_job_stop` 终止；
+- `lost`：进程消失且没有退出码（重启、OOM、外部 kill）；
+- `corrupt`：目录存在但 `meta.json` 缺失。
+
+远端布局：
+
+```text
+~/.opencode-ssh/jobs/<job_id>/
+  meta.json  job.sh  pid  started_at  exit_code  stopped_at  output.log
+```
+
+使用约定：
+
+- 长任务应使用 job，而不是把 `ssh_exec` 的 `timeout_ms` 调到几小时；
+- 环境变量直接写在命令里：`export FOO=bar && python train.py`；
+- 任务结束后用 `ssh_remove` 删除 `job_dir` 做清理；
+- 只支持 POSIX 远端；
+- **Docker 没有容器级跟踪**：job 记录的是宿主机进程。`docker run -d` 会立刻返回，`docker exec` 不会随 job 停止；停止前台 `docker run` 也可能留下容器。给容器加 `--name`，用 `docker stop` 管理。
+
 ---
 
 ## 3. 权限集成
@@ -294,6 +326,8 @@ sudo 示例（需要 profile 或连接上保存了 `sudo_password`）：
 写、编辑、删除、传输文件的工具使用更细的粒度：
 
 - resource：`user@host:/absolute/path`
+
+`ssh_job_start` 和 `ssh_job_stop` 使用主机级粒度（与 `ssh_exec` 相同），`ssh_job_status` 不额外确认。
 
 读、glob、grep 不触发额外确认。
 

@@ -7,6 +7,7 @@ import { ProfileStore } from "./profiles.js";
 import { SshRpc } from "./rpc.js";
 import { createRpcHandlers } from "./rpc-handlers.js";
 import { ConnectionManager } from "./ssh/manager.js";
+import { JobService } from "./ssh/jobs.js";
 import { SearchService } from "./ssh/search.js";
 import { createSshTools } from "./tools/definitions.js";
 
@@ -24,6 +25,7 @@ export default Plugin.define({
     );
     const manager = new ConnectionManager(config, profiles, knownHosts);
     const search = new SearchService(manager);
+    const jobs = new JobService(manager);
     const rpcRegistration = await ctx.rpc.register(
       SshRpc,
       createRpcHandlers({ manager, profiles }),
@@ -33,6 +35,7 @@ export default Plugin.define({
       profiles,
       config,
       search,
+      jobs,
       assertPermission: async (request) => {
         await ctx.permission.assert({
           // The plugin tool context carries branded ids. They are strings at

@@ -589,7 +589,10 @@ async function walkRemote(
   return result;
 }
 
-async function ensureRemoteDir(sftp: SftpLike, directory: string): Promise<void> {
+export async function ensureRemoteDir(
+  sftp: SftpLike,
+  directory: string,
+): Promise<void> {
   const normalized = posix.normalize(directory);
   if (normalized === "/" || normalized === ".") return;
 
