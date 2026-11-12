@@ -1,0 +1,73 @@
+import { Plugin } from "@opencode/plugin";
+import path from "node:path";
+import { resolveConfig } from "./config.js";
+import { SecretBox } from "./crypto.js";
+import { KnownHostsStore } from "./known-hosts.js";
+import { ProfileStore } from "./profiles.js";
+import { SshRpc } from "./rpc.js";
+import { createRpcHandlers } from "./rpc-handlers.js";
+import { ConnectionManager } from "./ssh/manager.js";
+import { createSshTools } from "./tools/definitions.js";
+
+export default Plugin.define({
+  id: "opencode-ssh",
+  async setup(ctx) {
+    const config = resolveConfig(ctx.options, ctx.location.directory);
+    const secretBox = new SecretBox(config.dataDir);
+    // ctx.storage is SQLite-backed and managed by OpenCode. ProfileStore
+    // lazily creates the "profiles" entry on first write.
+    const profiles = new ProfileStore(ctx.storage, secretBox);
+    await profiles.ensureInitialized();
+    const knownHosts = new KnownHostsStore(
+      path.join(config.dataDir, "known_hosts.json"),
+    );
+    const manager = new ConnectionManager(config, profiles, knownHosts);
+    const rpcRegistration = await ctx.rpc.register(
+      SshRpc,
+      createRpcHandlers({ manager, profiles }),
+    );
+    const tools = createSshTools({
+      manager,
+      profiles,
+      config,
+      assertPermission: async (request) => {
+        await ctx.permission.assert({
+          // The plugin tool context carries branded ids. They are strings at
+          // runtime; the casts keep this adapter independent of OpenCode's
+          // internal schema package.
+          sessionID: request.sessionID as never,
+          agent: request.agent as never,
+          source: {
+            type: "tool",
+            messageID: request.messageID as never,
+            id: request.toolCallID as never,
+          },
+          action: "ssh",
+          resources: [request.resource],
+          save: [request.resource],
+        });
+      },
+    });
+
+    const registration = await ctx.tool.transform((editor) => {
+      editor.namespace({
+        name: "ssh",
+        description:
+          "Persistent SSH connections, encrypted profiles, and remote command execution.",
+      });
+      for (const tool of tools) editor.add(tool);
+    });
+
+    return async () => {
+      try {
+        await registration.dispose();
+      } finally {
+        try {
+          await rpcRegistration.dispose();
+        } finally {
+          await manager.dispose();
+        }
+      }
+    };
+  },
+});

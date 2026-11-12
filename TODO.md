@@ -1,0 +1,121 @@
+# TODO
+
+开发过程记录，只用于跟踪进度和待办。功能说明见 `README.md`，Agent 约定见 `AGENTS.md`。
+
+维护规则：
+
+- 完成一项就移到底部“已完成”，保留简短说明和日期。
+- 新增待办写清“问题现象 + 预期行为”，避免只写标题。
+- 不要在这里重复 README 的工具参数和用法。
+
+---
+
+## 进行中
+
+- [ ] **TUI 完整重启后回归验证**
+  - 必须完全退出 OpenCode TUI 再启动，`/reload` 不够。
+  - 验证 `/ssh-connect`、`/ssh-disconnect`、`/ssh-list`、`/ssh-profile`。
+  - 重点看：auth 和 host-key 选择只走确认框、不出现文本框；手动连接重复目标时的“复用 / 新建”；profile 只显示名称和 `user@host:port`。
+
+---
+
+## 待办
+
+### P1
+
+- [ ] **长任务模型：job start / status / logs / stop / list / cleanup**
+  - 背景：`ssh_exec` 的 `timeout_ms` 是单次调用等待上限，无法承载数小时的训练/量化任务；调大只是拖住 channel，断线就丢结果。
+  - 目标：把任务生命周期从 SSH channel 里解耦，工具调用只做短请求。
+  - 建议工具（名字待定，倾向独立工具而不是 `action` 参数，模型更容易选对）：
+    - `ssh_job_start`：`nohup`/`setsid` 后台启动，立即返回 `job_id`、pid、日志路径
+    - `ssh_job_status`：`kill -0` 判断存活 + `ps` 输出运行时长和退出码
+    - `ssh_job_logs`：`tail -n` / `tail -c` 取日志，复用 `max_output_bytes` 截断
+    - `ssh_job_stop`：先 `SIGTERM`，宽限后 `SIGKILL`
+    - `ssh_job_list`：列出该主机上由插件创建的任务
+    - `ssh_job_cleanup`：删除已结束任务的目录和元数据
+  - 远端布局：`~/.opencode-ssh/jobs/<job_id>/` 存 `meta.json`（命令、cwd、pid、启动时间、日志路径）和 `output.log`，目录权限 `0700`。
+  - 关键点：
+    - 启动命令必须脱离 channel 和 TTY，避免断线时收到 SIGHUP；
+    - 不假设 systemd，直接 `nohup sh -c '...' &`；
+    - `job_id` 与 `ssh_id` 解耦，连接重来后仍可查；
+    - 日志可能含敏感信息，不做明文回传以外的额外复制。
+  - 与 `timeout_ms` 的关系：`start` 结束即返回，`timeout_ms` 只用于短操作；不再需要 `timeout -k` 补丁。
+  - 限制：仅 POSIX 远端；Windows 远端不支持。需要新增 smoke 测试覆盖 start/status/logs/stop。
+
+- [ ] **补充真实服务器回归**
+  - 现有 `scripts/smoke.ts`、`scripts/tui-smoke.ts` 都基于本地 ssh2 测试服务器。
+  - 已在真实 Linux 主机（root + 私钥）手工验证：
+    - 基础执行、`cwd`、`env`、非 0 退出码、大输出截断与调大上限
+    - `sudo: true`（root 免密场景）、profile 复用、`force_new`
+    - 失效 `ssh_id` 报 `No active SSH connection`
+    - 执行中断线报 `SSH connection ... was lost while the command was running.`
+    - 后台 job 模式（`nohup ... &` + `ps` + 日志）可用
+    - 密码认证（同一主机的 password profile）连接和执行正常
+  - 仍缺：
+    - 非 root 用户的真实 sudo 密码（含密码错误提示）
+    - 主机指纹不匹配 / `strict` 拒绝首次连接的真实场景
+    - 长时间大流量命令（如几百 MB 输出）
+  - 这些用例应沉淀成可选的真实主机测试脚本，而不是依赖手工。
+
+- [ ] **`idleTimeoutMs` 默认 0 的取舍**
+  - 当前空闲连接不会自动断开，直到 OpenCode 退出。
+  - 需要决定：保持默认不断开，还是给一个默认值（例如 30 分钟）并写进 README 选项表。
+
+- [ ] **profile 活跃状态是快照**
+  - `/ssh-connect`、`/ssh-profile` 的 `[active]` 只在打开菜单时计算一次。
+  - 菜单打开期间 agent 或其他窗口连接/断开，显示不会更新。
+  - 影响仅为显示层，实际连接由 `ConnectionManager` 复用兜底。
+
+- [ ] **TUI 调试日志收尾**
+  - `src/tui.ts` 的 `debugLog` 硬编码了 `D:/codefile/maincode/opencode-ssh/tui-debug.log`。
+  - 需要改成基于 `dataDir` 或环境变量的路径，或者确认不再需要后整体删除。
+
+### P2（低优先级）
+
+- [ ] **host_key_policy 仍是两步确认框**
+  - 现在是“accept-new vs 其他” + “strict vs insecure” 两次确认，不是真正的三选项菜单。
+  - 原因：select 对话框带过滤输入，用户不希望选择策略还要打字。
+  - 预期：如果要单选，需要写自定义 JSX 对话框，一次展示 `accept-new` / `strict` / `insecure`。
+
+- [ ] **文件、密钥和 known_hosts 没有备份/迁移机制**
+  - 涉及 `%APPDATA%\opencode-ssh\master.key`、private key 路径、`known_hosts.json`。
+  - 当前换机器或重装需要手动重新录入 profile 和主机指纹。
+  - 预期：至少提供导出/导入说明；更高优先级方案是迁移到 `ctx.storage` 并支持加密导出。
+
+### P3（最低）
+
+- [ ] **SSH agent 支持**
+  - 目前只能用私钥文件 + 口令，密码和私钥都由插件自己管理。
+  - 预期：Windows 上支持 Pageant / OpenSSH agent，避免把私钥路径和口令交给插件。
+  - 属于能力扩展，不是稳定性修复；认证失败多时再考虑。
+
+- [ ] **ProxyJump（跳板机）**
+  - 目前只能直连目标主机，内网机器必须先手工转发或登录跳板机。
+  - 预期：`proxy_jump` 参数或 profile 字段，经跳板机建立隧道。
+  - 只对“直连不到”的机器有意义，按需求再加。
+
+- [ ] **端口转发 / 隧道**
+  - 目前不支持本地转发、远程转发和动态转发。
+  - 与“执行命令”是两类需求，优先级最低。
+
+- [ ] **`known_hosts` 从本地 JSON 迁移到 SQLite**
+  - 当前 `known_hosts.json` 由 `src/known-hosts.ts` 直接读写文件。
+  - profile 已经走 `ctx.storage`，主机指纹仍是独立 JSON，换机器时两份数据要分别处理。
+  - 预期：改用 `ctx.storage` 的 key（如 `knownHosts`），保留现有 TOFU 校验逻辑；需要一次性迁移读取旧 JSON，读取成功后再删除或改名备份。
+  - 不做也可以：功能正常，只是数据分散在两处。
+
+---
+
+## 已完成
+
+- 2026-11：7 个工具（connect / disconnect / list / exec / profile_add / profile_update / profile_remove / profile_list）实现完毕。
+- 2026-11：profile 迁移到 `ctx.storage`（SQLite），移除 `profiles.json`。
+- 2026-11：密码、私钥口令、sudo 密码使用 AES-256-GCM 加密；活跃连接和 sudo 密码仅保存在内存。
+- 2026-11：TOFU 主机指纹校验（`known_hosts.json`）。
+- 2026-11：TUI 斜杠指令与 RPC 打通，修复 `[object Object]` 错误显示。
+- 2026-11：连接默认复用（同 profile 或同 `user@host:port`），新增 `force_new`，复用结果标记 `reused: true`。
+- 2026-11：工具描述补充“先 `ssh_list`、优先复用”；新增 `AGENTS.md`。
+- 2026-11：删除 `/ssh-connect-list` 和 `/ssh-profile-*` 别名；精简手动连接提示和 profile 展示。
+- 2026-11：`ssh_exec` 执行期间连接断开或通道无退出状态时明确报错，不再返回 `exit_code: unknown`。
+- 2026-11-13：真实 Linux 主机（root）手工回归通过：私钥与密码两种认证、基础执行、`cwd`/`env`、非 0 退出码、输出截断、sudo、profile 复用、`force_new`、失效 `ssh_id`、执行中断线报错、后台 job 模式。
+- 2026-11：`npm run typecheck`、`npm run test:smoke`、`npm run test:tui` 通过。
