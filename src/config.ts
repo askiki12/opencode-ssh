@@ -84,7 +84,7 @@ export function resolveConfig(
   };
 }
 
-function defaultDataDir(): string {
+export function defaultDataDir(): string {
   if (process.platform === "win32" && process.env.APPDATA) {
     return path.join(process.env.APPDATA, "opencode-ssh");
   }

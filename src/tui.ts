@@ -1,7 +1,7 @@
-import { appendFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { appendFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { Plugin } from "@opencode/plugin/tui";
+import { defaultDataDir } from "./config.js";
 import type { PublicProfile } from "./profiles.js";
 import { SshRpc } from "./rpc.js";
 import type { ConnectionInfo } from "./ssh/manager.js";
@@ -10,8 +10,14 @@ function debugLog(message: string): void {
   const target = process.env.OPENCODE_SSH_TUI_DEBUG;
   if (!target) return;
   const file =
-    target === "1" ? path.join(tmpdir(), "opencode-ssh-tui.log") : target;
+    target === "1"
+      ? path.join(
+          process.env.OPENCODE_SSH_HOME ?? defaultDataDir(),
+          "tui-debug.log",
+        )
+      : target;
   try {
+    mkdirSync(path.dirname(file), { recursive: true });
     appendFileSync(file, `${new Date().toISOString()} ${message}\n`);
   } catch {
     // Debug logging must never break the TUI.

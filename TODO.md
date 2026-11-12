@@ -108,4 +108,5 @@
 - 2026-11-13：文件工具在真实主机验证通过：读写、唯一匹配与歧义拒绝、覆盖保护、`glob`（find 回退）、`grep`（grep 回退）、二进制检测、截断、删除 `dry_run`/实际删除、上传下载。
 - 2026-11-13：新增长任务工具 `ssh_job_start` / `ssh_job_status` / `ssh_job_stop`：远端 `~/.opencode-ssh/jobs/<job_id>/` 为唯一状态源，`setsid` + 进程组终止，`stopped_at` 标记，支持列表与日志尾部。真实主机验证：启动 400ms 返回、运行/完成/停止状态、退出码、日志、清理。Docker 容器不会随 job 停止（已记录限制）。
 - 2026-11：`npm run typecheck`、`npm run test:smoke`、`npm run test:tui` 通过。
-- 2026-11-13：TUI 调试日志不再硬编码项目路径：`OPENCODE_SSH_TUI_DEBUG=1` 写入系统临时目录，设为其他值则按路径写入。
+- 2026-11-13：TUI 调试日志不再硬编码项目路径：`OPENCODE_SSH_TUI_DEBUG=1` 写入插件数据目录（`OPENCODE_SSH_HOME` 或平台默认目录）下的 `tui-debug.log`，设为其他值则按路径写入。
+- 2026-11-13：Docker 容器级跟踪不作为工具功能：job 只跟踪宿主机进程，容器生命周期由 `docker ps` / `docker stop` 单独决定，工具描述、README、AGENTS.md 已划定职责。
