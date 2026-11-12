@@ -309,10 +309,11 @@ sudo 示例（需要 profile 或连接上保存了 `sudo_password`）：
 使用约定：
 
 - 长任务应使用 job，而不是把 `ssh_exec` 的 `timeout_ms` 调到几小时；
+- job 跟踪的是**前台命令**；如果命令自己 `nohup` / `&` / `docker run -d`，job 会立即结束，只记录了启动器；
 - 环境变量直接写在命令里：`export FOO=bar && python train.py`；
 - 任务结束后用 `ssh_remove` 删除 `job_dir` 做清理；
 - 只支持 POSIX 远端；
-- **Docker 没有容器级跟踪**：job 记录的是宿主机进程。`docker run -d` 会立刻返回，`docker exec` 不会随 job 停止；停止前台 `docker run` 也可能留下容器。给容器加 `--name`，用 `docker stop` 管理。
+- **只跟踪宿主机进程**：容器有独立生命周期。`docker run -d` 会立刻返回，`docker exec` 不随 job 停止，停止 job 也可能留下容器；是否继续或停止容器需另外决定（`docker ps` / `docker stop`）。
 
 ---
 

@@ -764,9 +764,8 @@ export function createSshTools(
     {
       name: "read",
       description:
-        "Read a remote file with line numbers. Prefer this over ssh_exec cat for inspecting files: " +
-        "it is binary-safe, supports offset/limit, and caps how many bytes are returned. " +
-        "Paths must be absolute or start with ~/.",
+        "Read a remote file with line numbers. Prefer this over ssh_exec with cat for inspecting files: " +
+        "it is binary-safe, supports offset/limit, and caps how many bytes are returned.",
       input: READ_INPUT,
       options: { namespace: "ssh", codemode: true },
       execute: async (raw) => {
@@ -811,7 +810,7 @@ export function createSshTools(
         "Write a complete remote file as UTF-8 using an atomic temp-file rename. " +
         "Parent directories are created automatically. " +
         "By default an existing file is an error; pass overwrite: true to replace it, " +
-        "or use ssh_edit for a targeted change. Paths must be absolute or start with ~/.",
+        "or use ssh_edit for a targeted change.",
       input: WRITE_INPUT,
       options: { namespace: "ssh", codemode: true },
       execute: async (raw, context) => {
@@ -852,7 +851,7 @@ export function createSshTools(
       description:
         "Replace exact text in a remote file and write it atomically, preserving permissions. " +
         "old_text must occur exactly once unless replace_all is true; otherwise the edit fails " +
-        "so an ambiguous change is never applied. Paths must be absolute or start with ~/.",
+        "so an ambiguous change is never applied.",
       input: EDIT_INPUT,
       options: { namespace: "ssh", codemode: true },
       execute: async (raw, context) => {
@@ -1093,12 +1092,11 @@ export function createSshTools(
       name: "job_start",
       description:
         "Start a long-running remote command detached from the SSH channel and return a job_id. " +
-        "Use this for tasks that outlive one tool call (training, builds, migrations) instead of raising exec timeout_ms. " +
+        "Use this for tasks that outlive one tool call (training, builds, migrations) instead of raising ssh_exec timeout_ms. " +
         "The process survives disconnect and OpenCode restarts. " +
         "Environment variables go inline in the command (export FOO=bar && ...). " +
-        "Docker works as a normal command, but the job tracks the host process only: docker run -d returns immediately, " +
-        "docker exec does not stop the container, and stopping a foreground docker run may leave the container running. " +
-        "Give containers an explicit --name and stop them with docker stop when needed. " +
+        "Run a foreground command: if it backgrounds itself (nohup, &, docker run -d), the job finishes immediately and tracks only the launcher. " +
+        "Only the host process is tracked; containers keep their own lifecycle, so decide separately whether to stop or leave them running. " +
         "Inspect with ssh_job_status, terminate with ssh_job_stop, clean up with ssh_remove on job_dir. POSIX remotes only.",
       input: JOB_START_INPUT,
       options: { namespace: "ssh", codemode: true },
@@ -1177,6 +1175,7 @@ export function createSshTools(
         "Terminate a running job with SIGTERM, then SIGKILL after a short grace period. " +
         "Kills the whole process group when available. Refuses to signal a pid whose command line " +
         "does not belong to the job, which protects against pid reuse. " +
+        "Only the host process is tracked; containers keep their own lifecycle and are not stopped. " +
         "Finished jobs are reported without doing anything.",
       input: JOB_STOP_INPUT,
       options: { namespace: "ssh", codemode: true },

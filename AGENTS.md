@@ -69,6 +69,7 @@ Rules that matter:
 Use the job tools when a task should outlive one tool call (training, builds, migrations, long test suites):
 
 - `ssh_job_start` returns `job_id`, `pid`, `job_dir`, and the log path. It returns immediately; it does not wait for the command.
+- The job wraps a **foreground** command. If the command backgrounds itself (`nohup`, `&`, `docker run -d`), the job finishes immediately and tracks only the launcher — use `ssh_exec` and manage that process yourself instead.
 - Do **not** raise `ssh_exec`'s `timeout_ms` to hours. That holds a channel open and loses the result on disconnect.
 - `ssh_job_status` with `job_id` shows state, exit code, elapsed time; add `log_lines` to tail output. Call it without `job_id` to list all jobs.
 - States: `running`, `finished`, `stopped`, `lost` (process gone, no exit code), `corrupt`.
@@ -76,7 +77,7 @@ Use the job tools when a task should outlive one tool call (training, builds, mi
 - Clean up finished jobs with `ssh_remove` on `job_dir` (use `dry_run` first).
 - Environment variables go inline: `export FOO=bar && python train.py`.
 - Jobs survive disconnect and reconnect; state lives under `~/.opencode-ssh/jobs/` on the remote.
-- Docker is not tracked at container level: `docker run -d` returns immediately, `docker exec` does not stop the container, and stopping a foreground `docker run` may leave the container running. Name the container and use `docker stop` when needed.
+- Only the **host process** is tracked. Containers keep their own lifecycle: stopping a job may leave the container running, so decide separately whether to stop or keep it (`docker ps`, `docker stop`).
 - POSIX remotes only.
 
 ## Security
