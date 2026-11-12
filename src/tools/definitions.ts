@@ -1,10 +1,22 @@
 import type { ResolvedConfig } from "../config.js";
 import type { ProfileStore } from "../profiles.js";
+import {
+  DEFAULT_READ_BYTES,
+  MAX_READ_BYTES,
+  editRemoteFile,
+  readRemoteFile,
+  removeRemotePath,
+  resolveRemotePath,
+  transferPath,
+  writeRemoteFile,
+} from "../ssh/files.js";
+import type { ReadRemoteFileResult } from "../ssh/files.js";
 import type {
   ConnectionInfo,
   ConnectionManager,
   ExecResult,
 } from "../ssh/manager.js";
+import type { SearchService } from "../ssh/search.js";
 import { errorMessage } from "../util.js";
 
 export interface ExecuteContext {
@@ -30,6 +42,7 @@ export interface ToolDependencies {
   manager: ConnectionManager;
   profiles: ProfileStore;
   config: ResolvedConfig;
+  search: SearchService;
   assertPermission?: (request: SshPermissionRequest) => Promise<void>;
 }
 
@@ -173,6 +186,207 @@ const EXEC_INPUT = {
     },
   },
   required: ["ssh_id", "command"],
+  additionalProperties: false,
+} as const;
+
+const PATH_SCHEMA = {
+  type: "string",
+  description:
+    "Absolute remote path or a path starting with ~/ . Relative paths are rejected because SFTP and exec do not share a working directory.",
+} as const;
+
+const READ_INPUT = {
+  type: "object",
+  properties: {
+    ssh_id: {
+      type: "string",
+      description: "Connection id returned by ssh_connect.",
+    },
+    path: PATH_SCHEMA,
+    offset: {
+      type: "integer",
+      minimum: 1,
+      description: "First line to return, 1-based. Defaults to 1.",
+    },
+    limit: {
+      type: "integer",
+      minimum: 1,
+      description: "Maximum number of lines to return.",
+    },
+    max_bytes: {
+      type: "integer",
+      minimum: 1024,
+      maximum: MAX_READ_BYTES,
+      description: `Maximum bytes to read from the file. Defaults to ${DEFAULT_READ_BYTES}.`,
+    },
+  },
+  required: ["ssh_id", "path"],
+  additionalProperties: false,
+} as const;
+
+const WRITE_INPUT = {
+  type: "object",
+  properties: {
+    ssh_id: {
+      type: "string",
+      description: "Connection id returned by ssh_connect.",
+    },
+    path: PATH_SCHEMA,
+    content: {
+      type: "string",
+      description: "Full file content to write as UTF-8.",
+    },
+    overwrite: {
+      type: "boolean",
+      description:
+        "Replace the file if it already exists. Default false: an existing file is an error, use ssh_edit for a targeted change.",
+    },
+  },
+  required: ["ssh_id", "path", "content"],
+  additionalProperties: false,
+} as const;
+
+const EDIT_INPUT = {
+  type: "object",
+  properties: {
+    ssh_id: {
+      type: "string",
+      description: "Connection id returned by ssh_connect.",
+    },
+    path: PATH_SCHEMA,
+    old_text: {
+      type: "string",
+      description:
+        "Exact text to replace. Must occur exactly once unless replace_all is true.",
+    },
+    new_text: {
+      type: "string",
+      description: "Replacement text.",
+    },
+    replace_all: {
+      type: "boolean",
+      description: "Replace every occurrence instead of requiring a unique match.",
+    },
+  },
+  required: ["ssh_id", "path", "old_text", "new_text"],
+  additionalProperties: false,
+} as const;
+
+const GLOB_INPUT = {
+  type: "object",
+  properties: {
+    ssh_id: {
+      type: "string",
+      description: "Connection id returned by ssh_connect.",
+    },
+    pattern: {
+      type: "string",
+      description:
+        "Glob pattern relative to path, for example **/*.ts or src/**/*.{js,jsx}.",
+    },
+    path: {
+      type: "string",
+      description: "Directory to search. Defaults to the remote home directory.",
+    },
+    max_results: {
+      type: "integer",
+      minimum: 1,
+      maximum: 5000,
+      description: "Maximum number of paths to return. Defaults to 2000.",
+    },
+    include_hidden: {
+      type: "boolean",
+      description: "Include dotfiles and hidden directories. Default false.",
+    },
+  },
+  required: ["ssh_id", "pattern"],
+  additionalProperties: false,
+} as const;
+
+const GREP_INPUT = {
+  type: "object",
+  properties: {
+    ssh_id: {
+      type: "string",
+      description: "Connection id returned by ssh_connect.",
+    },
+    pattern: {
+      type: "string",
+      description: "Regular expression unless literal is true.",
+    },
+    path: {
+      type: "string",
+      description: "File or directory to search. Defaults to the remote home directory.",
+    },
+    include: {
+      type: "string",
+      description: "Only search files matching this glob, for example **/*.ts.",
+    },
+    literal: {
+      type: "boolean",
+      description: "Treat pattern as a literal string instead of a regular expression.",
+    },
+    case_sensitive: {
+      type: "boolean",
+      description: "Case-sensitive matching. Defaults to true.",
+    },
+    max_matches: {
+      type: "integer",
+      minimum: 1,
+      maximum: 5000,
+      description: "Maximum number of matches to return. Defaults to 200.",
+    },
+  },
+  required: ["ssh_id", "pattern"],
+  additionalProperties: false,
+} as const;
+
+const REMOVE_INPUT = {
+  type: "object",
+  properties: {
+    ssh_id: {
+      type: "string",
+      description: "Connection id returned by ssh_connect.",
+    },
+    path: PATH_SCHEMA,
+    recursive: {
+      type: "boolean",
+      description: "Required to remove a directory. Default false.",
+    },
+    dry_run: {
+      type: "boolean",
+      description:
+        "List what would be removed without deleting anything. Use this first for directories.",
+    },
+  },
+  required: ["ssh_id", "path"],
+  additionalProperties: false,
+} as const;
+
+const TRANSFER_INPUT = {
+  type: "object",
+  properties: {
+    ssh_id: {
+      type: "string",
+      description: "Connection id returned by ssh_connect.",
+    },
+    direction: {
+      type: "string",
+      enum: ["upload", "download"],
+      description: "upload = local to remote, download = remote to local.",
+    },
+    local_path: {
+      type: "string",
+      description: "Local file or directory path. ~ is expanded locally.",
+    },
+    remote_path: PATH_SCHEMA,
+    overwrite: {
+      type: "boolean",
+      description:
+        "Replace existing files on the destination. Default false: an existing file aborts the transfer.",
+    },
+  },
+  required: ["ssh_id", "direction", "local_path", "remote_path"],
   additionalProperties: false,
 } as const;
 
@@ -480,6 +694,334 @@ export function createSshTools(
     },
 
     {
+      name: "read",
+      description:
+        "Read a remote file with line numbers. Prefer this over ssh_exec cat for inspecting files: " +
+        "it is binary-safe, supports offset/limit, and caps how many bytes are returned. " +
+        "Paths must be absolute or start with ~/.",
+      input: READ_INPUT,
+      options: { namespace: "ssh", codemode: true },
+      execute: async (raw) => {
+        const input = asRecord(raw);
+        const sshId = requireString(input.ssh_id, "ssh_id");
+        const target = await resolveTargetPath(
+          dependencies.manager,
+          sshId,
+          input.path,
+        );
+        const sftp = await dependencies.manager.sftp(sshId);
+        const result = await readRemoteFile(sftp, target, {
+          ...(input.offset !== undefined
+            ? { offset: requireInteger(input.offset, "offset") }
+            : {}),
+          ...(input.limit !== undefined
+            ? { limit: requireInteger(input.limit, "limit") }
+            : {}),
+          ...(input.max_bytes !== undefined
+            ? { maxBytes: requireInteger(input.max_bytes, "max_bytes") }
+            : {}),
+        });
+
+        return {
+          content: formatReadResult(result),
+          metadata: {
+            path: result.path,
+            size: result.size,
+            startLine: result.startLine,
+            endLine: result.endLine,
+            totalLines: result.totalLines,
+            truncated: result.truncated,
+            binary: result.binary,
+          },
+        };
+      },
+    },
+
+    {
+      name: "write",
+      description:
+        "Write a complete remote file as UTF-8 using an atomic temp-file rename. " +
+        "Parent directories are created automatically. " +
+        "By default an existing file is an error; pass overwrite: true to replace it, " +
+        "or use ssh_edit for a targeted change. Paths must be absolute or start with ~/.",
+      input: WRITE_INPUT,
+      options: { namespace: "ssh", codemode: true },
+      execute: async (raw, context) => {
+        const input = asRecord(raw);
+        const sshId = requireString(input.ssh_id, "ssh_id");
+        const target = await resolveTargetPath(
+          dependencies.manager,
+          sshId,
+          input.path,
+        );
+        await assertPathPermission(dependencies, context, sshId, target);
+
+        const sftp = await dependencies.manager.sftp(sshId);
+        const result = await writeRemoteFile(
+          sftp,
+          target,
+          requireString(input.content, "content"),
+          {
+            ...(input.overwrite !== undefined
+              ? { overwrite: requireBoolean(input.overwrite, "overwrite") }
+              : {}),
+          },
+        );
+
+        return {
+          content: [
+            result.created ? "Created remote file." : "Overwrote remote file.",
+            `path: ${result.path}`,
+            `bytes: ${result.bytes}`,
+          ].join("\n"),
+          metadata: { ...result },
+        };
+      },
+    },
+
+    {
+      name: "edit",
+      description:
+        "Replace exact text in a remote file and write it atomically, preserving permissions. " +
+        "old_text must occur exactly once unless replace_all is true; otherwise the edit fails " +
+        "so an ambiguous change is never applied. Paths must be absolute or start with ~/.",
+      input: EDIT_INPUT,
+      options: { namespace: "ssh", codemode: true },
+      execute: async (raw, context) => {
+        const input = asRecord(raw);
+        const sshId = requireString(input.ssh_id, "ssh_id");
+        const target = await resolveTargetPath(
+          dependencies.manager,
+          sshId,
+          input.path,
+        );
+        await assertPathPermission(dependencies, context, sshId, target);
+
+        const sftp = await dependencies.manager.sftp(sshId);
+        const result = await editRemoteFile(
+          sftp,
+          target,
+          requireString(input.old_text, "old_text"),
+          requireString(input.new_text, "new_text"),
+          {
+            ...(input.replace_all !== undefined
+              ? { replaceAll: requireBoolean(input.replace_all, "replace_all") }
+              : {}),
+          },
+        );
+
+        return {
+          content: [
+            `Edited remote file: ${result.path}`,
+            `replacements: ${result.replacements}`,
+            "",
+            ...result.preview.map((line) => `${line.number}: ${line.text}`),
+          ].join("\n"),
+          metadata: {
+            path: result.path,
+            replacements: result.replacements,
+            firstLine: result.firstLine,
+          },
+        };
+      },
+    },
+
+    {
+      name: "glob",
+      description:
+        "Find remote files by glob pattern relative to a directory. " +
+        "Uses ripgrep when available, then find, then an SFTP walk. " +
+        "Default skips .git, node_modules, and hidden entries. " +
+        "Prefer this over shelling out to find/glob through ssh_exec.",
+      input: GLOB_INPUT,
+      options: { namespace: "ssh", codemode: true },
+      execute: async (raw) => {
+        const input = asRecord(raw);
+        const sshId = requireString(input.ssh_id, "ssh_id");
+        const root =
+          input.path === undefined
+            ? await dependencies.manager.homeDir(sshId)
+            : await resolveTargetPath(dependencies.manager, sshId, input.path);
+        const result = await dependencies.search.glob(sshId, {
+          pattern: requireString(input.pattern, "pattern"),
+          path: root,
+          ...(input.max_results !== undefined
+            ? { maxResults: requireInteger(input.max_results, "max_results") }
+            : {}),
+          ...(input.include_hidden !== undefined
+            ? { includeHidden: requireBoolean(input.include_hidden, "include_hidden") }
+            : {}),
+        });
+
+        const lines = [
+          `engine: ${result.engine}`,
+          `root: ${root}`,
+          `count: ${result.paths.length}`,
+          `truncated: ${result.truncated ? "yes" : "no"}`,
+          "",
+          ...(result.paths.length > 0 ? result.paths : ["(no matches)"]),
+        ];
+        return {
+          content: lines.join("\n"),
+          metadata: {
+            engine: result.engine,
+            root,
+            count: result.paths.length,
+            truncated: result.truncated,
+          },
+        };
+      },
+    },
+
+    {
+      name: "grep",
+      description:
+        "Search remote file contents. Runs on the remote host with ripgrep when available, " +
+        "otherwise grep; there is no line-by-line SFTP fallback because it is far slower. " +
+        "If the remote lacks both tools, suggest installing ripgrep via ssh_exec and ask the user first. " +
+        "Skips binary files; returns path, line number, and matching text up to max_matches.",
+      input: GREP_INPUT,
+      options: { namespace: "ssh", codemode: true },
+      execute: async (raw) => {
+        const input = asRecord(raw);
+        const sshId = requireString(input.ssh_id, "ssh_id");
+        const target =
+          input.path === undefined
+            ? await dependencies.manager.homeDir(sshId)
+            : await resolveTargetPath(dependencies.manager, sshId, input.path);
+        const result = await dependencies.search.grep(sshId, {
+          pattern: requireString(input.pattern, "pattern"),
+          path: target,
+          ...(input.include !== undefined
+            ? { include: requireString(input.include, "include") }
+            : {}),
+          ...(input.literal !== undefined
+            ? { literal: requireBoolean(input.literal, "literal") }
+            : {}),
+          ...(input.case_sensitive !== undefined
+            ? { caseSensitive: requireBoolean(input.case_sensitive, "case_sensitive") }
+            : {}),
+          ...(input.max_matches !== undefined
+            ? { maxMatches: requireInteger(input.max_matches, "max_matches") }
+            : {}),
+        });
+
+        const lines = [
+          `engine: ${result.engine}`,
+          `count: ${result.matches.length}`,
+          `truncated: ${result.truncated ? "yes" : "no"}`,
+          "",
+          ...(result.matches.length > 0
+            ? result.matches.map((match) => `${match.path}:${match.line}: ${match.text}`)
+            : ["(no matches)"]),
+        ];
+        return {
+          content: lines.join("\n"),
+          metadata: {
+            engine: result.engine,
+            count: result.matches.length,
+            truncated: result.truncated,
+          },
+        };
+      },
+    },
+
+    {
+      name: "remove",
+      description:
+        "Delete a remote file or directory. Removing a directory requires recursive: true. " +
+        "Use dry_run: true first to see exactly what would be deleted; this tool has its own " +
+        "path-scoped permission prompt instead of running rm through ssh_exec.",
+      input: REMOVE_INPUT,
+      options: { namespace: "ssh", codemode: true },
+      execute: async (raw, context) => {
+        const input = asRecord(raw);
+        const sshId = requireString(input.ssh_id, "ssh_id");
+        const target = await resolveTargetPath(
+          dependencies.manager,
+          sshId,
+          input.path,
+        );
+        const dryRun = input.dry_run === true;
+        if (!dryRun) {
+          await assertPathPermission(dependencies, context, sshId, target);
+        }
+
+        const sftp = await dependencies.manager.sftp(sshId);
+        const result = await removeRemotePath(sftp, target, {
+          ...(input.recursive !== undefined
+            ? { recursive: requireBoolean(input.recursive, "recursive") }
+            : {}),
+          dryRun,
+        });
+
+        const lines = [
+          `${result.dryRun ? "Would remove" : "Removed"}: ${result.path}`,
+          `entries: ${result.removed}`,
+          ...(result.listedTruncated
+            ? [`[note] listing truncated to the first ${result.entries.length} entries`]
+            : []),
+          "",
+          ...result.entries,
+        ];
+        return {
+          content: lines.join("\n"),
+          metadata: {
+            path: result.path,
+            dryRun: result.dryRun,
+            removed: result.removed,
+            listedTruncated: result.listedTruncated,
+          },
+        };
+      },
+    },
+
+    {
+      name: "transfer",
+      description:
+        "Copy files between the local machine and the remote host over SFTP. " +
+        "direction is upload or download; both file and directory paths are supported. " +
+        "Existing destination files abort the transfer unless overwrite: true. " +
+        "Symbolic links are rejected rather than followed.",
+      input: TRANSFER_INPUT,
+      options: { namespace: "ssh", codemode: true },
+      execute: async (raw, context) => {
+        const input = asRecord(raw);
+        const sshId = requireString(input.ssh_id, "ssh_id");
+        const direction = requireString(input.direction, "direction");
+        if (direction !== "upload" && direction !== "download") {
+          throw new Error("direction must be upload or download.");
+        }
+        const target = await resolveTargetPath(
+          dependencies.manager,
+          sshId,
+          input.remote_path,
+        );
+        await assertPathPermission(dependencies, context, sshId, target);
+
+        const sftp = await dependencies.manager.sftp(sshId);
+        const result = await transferPath(sftp, {
+          direction,
+          localPath: requireString(input.local_path, "local_path"),
+          remotePath: target,
+          ...(input.overwrite !== undefined
+            ? { overwrite: requireBoolean(input.overwrite, "overwrite") }
+            : {}),
+        });
+
+        return {
+          content: [
+            `${direction === "upload" ? "Uploaded" : "Downloaded"} ${result.files} file(s).`,
+            `local: ${result.localPath}`,
+            `remote: ${result.remotePath}`,
+            `bytes: ${result.bytes}`,
+          ].join("\n"),
+          metadata: { ...result },
+        };
+      },
+    },
+
+    {
       name: "profile_add",
       description:
         "Save a reusable SSH profile. Passwords and passphrases are encrypted at rest with AES-256-GCM. " +
@@ -742,6 +1284,65 @@ function formatProfile(
   if (profile.privateKeyPath) lines.push(`key: ${profile.privateKeyPath}`);
   lines.push(`sudo_password: ${profile.hasSudoPassword ? "yes" : "no"}`);
   lines.push(`host_key_policy: ${profile.hostKeyPolicy}`);
+  return lines.join("\n");
+}
+
+async function resolveTargetPath(
+  manager: ConnectionManager,
+  sshId: string,
+  value: unknown,
+): Promise<string> {
+  const home = await manager.homeDir(sshId);
+  return resolveRemotePath(requireString(value, "path"), home);
+}
+
+async function assertPathPermission(
+  dependencies: ToolDependencies,
+  context: ExecuteContext,
+  sshId: string,
+  target: string,
+): Promise<void> {
+  if (!dependencies.assertPermission) return;
+  const connection = dependencies.manager.getInfo(sshId);
+  await dependencies.assertPermission({
+    sessionID: context.sessionID,
+    agent: context.agent,
+    messageID: context.messageID,
+    toolCallID: context.id,
+    resource: `${connection.user}@${connection.host}:${target}`,
+  });
+}
+
+function formatReadResult(result: ReadRemoteFileResult): string {
+  const lines = [
+    `path: ${result.path}`,
+    `size: ${result.size}`,
+    `binary: ${result.binary ? "yes" : "no"}`,
+    `truncated: ${result.truncated ? "yes" : "no"}`,
+    result.totalLines === null
+      ? "lines: unknown"
+      : `lines: ${result.startLine}-${result.endLine} of ${result.totalLines}`,
+    "",
+  ];
+  if (result.binary) {
+    lines.push(
+      "[binary file] Content is not shown. Use ssh_exec with a dedicated tool if you need bytes.",
+    );
+    return lines.join("\n");
+  }
+  if (result.lines.length === 0) {
+    lines.push("(empty)");
+    return lines.join("\n");
+  }
+  for (const line of result.lines) {
+    lines.push(`${line.number}: ${line.text}`);
+  }
+  if (result.truncated) {
+    lines.push(
+      "",
+      "[note] Output was truncated. Read again with offset/limit or raise max_bytes.",
+    );
+  }
   return lines.join("\n");
 }
 

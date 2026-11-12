@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import { generateKeyPairSync } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import ssh2 from "ssh2";
@@ -9,8 +17,18 @@ import { SecretBox } from "../src/crypto.js";
 import { KnownHostsStore } from "../src/known-hosts.js";
 import { ProfileStore, type ProfileStorage } from "../src/profiles.js";
 import { buildRemoteCommand } from "../src/ssh/command.js";
+import {
+  editRemoteFile,
+  readRemoteFile,
+  removeRemotePath,
+  resolveRemotePath,
+  transferPath,
+  writeRemoteFile,
+} from "../src/ssh/files.js";
 import { ConnectionManager } from "../src/ssh/manager.js";
+import { globToRegExp, SearchService } from "../src/ssh/search.js";
 import { createSshTools, type ToolDefinition } from "../src/tools/definitions.js";
+import { createFakeSftp } from "./fake-sftp.js";
 
 const dataDir = mkdtempSync(path.join(tmpdir(), "opencode-ssh-smoke-"));
 process.env.OPENCODE_SSH_HOME = dataDir;
@@ -165,6 +183,155 @@ async function main() {
     path.resolve(dataDir, "relative-data"),
   );
 
+  const fileRoot = mkdtempSync(path.join(tmpdir(), "opencode-ssh-files-"));
+  try {
+    const sftp = createFakeSftp(fileRoot);
+
+    assert.equal(
+      resolveRemotePath("~/notes/a.txt", "/home/tester"),
+      "/home/tester/notes/a.txt",
+    );
+    assert.equal(resolveRemotePath("/var//tmp/x", "/home/tester"), "/var/tmp/x");
+    assert.throws(
+      () => resolveRemotePath("relative/x", "/home/tester"),
+      /absolute/,
+    );
+
+    assert.equal(globToRegExp("**/*.ts").test("src/a.ts"), true);
+    assert.equal(globToRegExp("**/*.ts").test("a.ts"), true);
+    assert.equal(globToRegExp("src/**/*.{js,jsx}").test("src/x/y.js"), true);
+    assert.equal(globToRegExp("src/**/*.{js,jsx}").test("src/x/y.ts"), false);
+    assert.equal(globToRegExp("*.md").test("docs/a.md"), false);
+
+    const created = await writeRemoteFile(
+      sftp,
+      "/project/hello.txt",
+      "one\ntwo\nthree\n",
+    );
+    assert.equal(created.created, true);
+    assert.equal(created.bytes, 14);
+
+    const listed = readdirNames(path.join(fileRoot, "project"));
+    assert.deepEqual(listed, ["hello.txt"]);
+
+    const read = await readRemoteFile(sftp, "/project/hello.txt");
+    assert.deepEqual(
+      read.lines.map((line) => line.text),
+      ["one", "two", "three"],
+    );
+    assert.equal(read.totalLines, 3);
+    const ranged = await readRemoteFile(sftp, "/project/hello.txt", {
+      offset: 2,
+      limit: 5,
+    });
+    assert.deepEqual(
+      ranged.lines.map((line) => line.number),
+      [2, 3],
+    );
+
+    await assert.rejects(
+      writeRemoteFile(sftp, "/project/hello.txt", "replaced"),
+      /already exists/,
+    );
+    const replaced = await writeRemoteFile(
+      sftp,
+      "/project/hello.txt",
+      "one\ntwo\nthree four\n",
+      { overwrite: true },
+    );
+    assert.equal(replaced.created, false);
+
+    await assert.rejects(
+      editRemoteFile(sftp, "/project/hello.txt", "t", "T"),
+      /Found 2 matches/,
+    );
+    const edited = await editRemoteFile(
+      sftp,
+      "/project/hello.txt",
+      "t",
+      "T",
+      { replaceAll: true },
+    );
+    assert.equal(edited.replacements, 2);
+    const afterEdit = await readRemoteFile(sftp, "/project/hello.txt");
+    assert.deepEqual(
+      afterEdit.lines.map((line) => line.text),
+      ["one", "Two", "Three four"],
+    );
+
+    const binaryPath = "/project/data.bin";
+    writeFileSync(path.join(fileRoot, "project", "data.bin"), Buffer.from([1, 0, 2]));
+    const binary = await readRemoteFile(sftp, binaryPath);
+    assert.equal(binary.binary, true);
+    assert.equal(binary.lines.length, 0);
+    assert.match(
+      await captureError(() => editRemoteFile(sftp, binaryPath, "a", "b")),
+      /binary/,
+    );
+
+    writeFileSync(path.join(fileRoot, "big.txt"), `${"a\n".repeat(5000)}`);
+    const truncated = await readRemoteFile(sftp, "/big.txt", { maxBytes: 1024 });
+    assert.equal(truncated.truncated, true);
+    assert.equal(truncated.totalLines, null);
+
+    const nested = await writeRemoteFile(
+      sftp,
+      "/tree/a/b/c.txt",
+      "deep\n",
+    );
+    assert.equal(nested.created, true);
+    const dryRun = await removeRemotePath(sftp, "/tree", {
+      recursive: true,
+      dryRun: true,
+    });
+    assert.equal(dryRun.dryRun, true);
+    assert.equal(dryRun.removed, 0);
+    assert.ok(dryRun.entries.includes("/tree/a/b/c.txt"));
+    assert.equal(existsLocally(path.join(fileRoot, "tree", "a", "b", "c.txt")), true);
+
+    await assert.rejects(
+      removeRemotePath(sftp, "/tree"),
+      /recursive: true/,
+    );
+    const removed = await removeRemotePath(sftp, "/tree", { recursive: true });
+    assert.equal(removed.removed, 4);
+    assert.equal(existsLocally(path.join(fileRoot, "tree")), false);
+
+    const localSource = path.join(fileRoot, "local-src");
+    mkdirSync(localSource, { recursive: true });
+    writeFileSync(path.join(localSource, "one.txt"), "upload-one\n");
+    writeFileSync(path.join(localSource, "two.txt"), "upload-two\n");
+
+    const upload = await transferPath(sftp, {
+      direction: "upload",
+      localPath: localSource,
+      remotePath: "/backup/src",
+    });
+    assert.equal(upload.files, 2);
+    assert.equal(readFileSync(path.join(fileRoot, "backup", "src", "one.txt"), "utf8"), "upload-one\n");
+
+    await assert.rejects(
+      transferPath(sftp, {
+        direction: "upload",
+        localPath: localSource,
+        remotePath: "/backup/src",
+      }),
+      /already exists/,
+    );
+
+    const localTarget = path.join(fileRoot, "local-dst");
+    const download = await transferPath(sftp, {
+      direction: "download",
+      localPath: localTarget,
+      remotePath: "/backup/src",
+      overwrite: true,
+    });
+    assert.equal(download.files, 2);
+    assert.equal(readFileSync(path.join(localTarget, "two.txt"), "utf8"), "upload-two\n");
+  } finally {
+    rmSync(fileRoot, { recursive: true, force: true });
+  }
+
   const config = resolveConfig(
     { dataDir, connectTimeoutMs: 3000, execTimeoutMs: 5000 },
     dataDir,
@@ -318,6 +485,7 @@ async function main() {
       manager,
       profiles,
       config,
+      search: new SearchService(manager),
       assertPermission: async (request) => {
         permissionRequests.push({ resource: request.resource });
       },
@@ -566,4 +734,21 @@ async function startTestSshServer(): Promise<{
         server.close(() => resolve());
       }),
   };
+}
+
+function readdirNames(directory: string): string[] {
+  return readdirSync(directory).sort();
+}
+
+function existsLocally(target: string): boolean {
+  return existsSync(target);
+}
+
+async function captureError(run: () => Promise<unknown>): Promise<string> {
+  try {
+    await run();
+    return "";
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
 }

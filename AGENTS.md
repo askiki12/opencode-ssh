@@ -42,6 +42,28 @@ ssh_list
 - A non-zero exit code is normal command output, not a tool failure. Read `exit_code`, stdout, and stderr.
 - Avoid interactive commands unless `tty: true` is required.
 
+## Remote file operations
+
+Prefer the file tools over shelling out through `ssh_exec`:
+
+- `ssh_read` instead of `cat` / `sed -n`
+- `ssh_write` for whole files (atomic, creates parent directories)
+- `ssh_edit` for targeted changes (exact match, must be unique unless `replace_all`)
+- `ssh_glob` instead of `find` / `ls -R`
+- `ssh_grep` instead of `grep -r`
+- `ssh_remove` instead of `rm` (path-scoped permission, use `dry_run` first)
+- `ssh_transfer` instead of scp/base64 pipes
+
+Rules that matter:
+
+- Paths must be absolute or start with `~/`; relative paths are rejected.
+- `ssh_write` refuses to overwrite unless `overwrite: true` is passed deliberately.
+- `ssh_edit` fails when `old_text` matches more than once unless `replace_all: true`.
+- Before deleting a directory, call `ssh_remove` with `dry_run: true`, then repeat with `recursive: true`.
+- Write, edit, remove, and transfer trigger a path-level permission prompt; read, glob, and grep do not.
+- `ssh_grep` / `ssh_glob` need `rg`, `grep`, or `find` on the remote. If both `rg` and `grep` are missing, tell the user and offer to install ripgrep via `ssh_exec` (ask before installing). Never fall back to reading every file over SFTP.
+- Do not download large files just to inspect them; use `ssh_read` with `offset` / `limit`.
+
 ## Security
 
 - Do not put passwords, private key passphrases, or sudo passwords in user-facing summaries.

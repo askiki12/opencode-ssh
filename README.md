@@ -263,6 +263,25 @@ sudo 示例（需要 profile 或连接上保存了 `sudo_password`）：
 
 无参数。列出 profile 的 id、名称、`user@host:port`、认证方式、私钥路径、是否有 sudo 密码、主机指纹策略。不会返回密码。
 
+### 2.9 远程文件工具
+
+| 工具 | 用途 | 关键规则 |
+| --- | --- | --- |
+| `ssh_read` | 读取远端文件 | 带行号；`offset` / `limit`；二进制只报告不输出；默认 256KB |
+| `ssh_write` | 完整写入文件 | 原子写；自动建父目录；默认**不覆盖**，需 `overwrite: true` |
+| `ssh_edit` | 精确替换文本 | 默认要求唯一匹配，否则 `replace_all: true`；保留权限 |
+| `ssh_glob` | 按名字找文件 | `rg` → `find` → SFTP 遍历；默认跳过 `.git`、`node_modules`、隐藏项 |
+| `ssh_grep` | 按内容搜索 | 远端 `rg` → `grep`；**没有 SFTP 逐字节兜底** |
+| `ssh_remove` | 删除文件或目录 | 目录需 `recursive: true`；建议先 `dry_run: true` |
+| `ssh_transfer` | 本地 ↔ 远端传输 | `upload` / `download`；覆盖需 `overwrite: true`；拒绝符号链接 |
+
+共同约定：
+
+- 路径必须是绝对路径或 `~/...`；相对路径直接拒绝，因为 SFTP 和 exec 不共享工作目录。
+- 写、编辑、删除、传输使用路径级权限检查，resource 为 `user@host:/path`；读、glob、grep 不额外确认。
+- `ssh_grep` / `ssh_glob` 依赖远端有 `rg`、`grep` 或 `find`；都没有时 `ssh_grep` 会明确报错，并提示可以用 `ssh_exec` 安装 ripgrep。
+- 不建议用 `ssh_exec cat` 读大文件，也不建议把大文件传到本地再搜索。
+
 ---
 
 ## 3. 权限集成
@@ -271,6 +290,12 @@ sudo 示例（需要 profile 或连接上保存了 `sudo_password`）：
 
 - action：`ssh`
 - resource：`user@host:port`
+
+写、编辑、删除、传输文件的工具使用更细的粒度：
+
+- resource：`user@host:/absolute/path`
+
+读、glob、grep 不触发额外确认。
 
 可以在 `opencode.json(c)` 中配置，例如生产机器执行前询问：
 
@@ -476,7 +501,7 @@ npm run test:smoke
 npm run test:tui
 ```
 
-- `test:smoke` 会在本机启动临时 SSH 测试服务，覆盖加密、profile 生命周期、known-hosts、连接、执行、sudo 包装和工具层。
+- `test:smoke` 会在本机启动临时 SSH 测试服务，覆盖加密、profile 生命周期、known-hosts、连接、执行、sudo 包装、工具层，以及基于假 SFTP 的远程文件读写/编辑/删除/传输。
 - `test:tui` 使用 mock 的 dialog/RPC 覆盖 TUI 指令注册、连接选择、profile 新增/改名、编辑失败、disconnect 和 remove 流程。
 - 真实 OpenCode 联调还需验证：TUI 选择框、私钥列表、连接测试后再保存、RPC 跨 location 行为。
 - 开发进度和待办记录在 `TODO.md`。

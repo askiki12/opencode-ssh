@@ -1,6 +1,11 @@
 import { readFile } from "node:fs/promises";
 import ssh2 from "ssh2";
-import type { Client as SshClient, ClientChannel, ConnectConfig } from "ssh2";
+import type {
+  Client as SshClient,
+  ClientChannel,
+  ConnectConfig,
+  SFTPWrapper,
+} from "ssh2";
 import type { ResolvedConfig } from "../config.js";
 import { fingerprintFromHex, KnownHostsStore } from "../known-hosts.js";
 import type {
@@ -93,6 +98,10 @@ interface ActiveConnection {
   lastUsedAt: number;
   busy: number;
   lastError?: string;
+  /** Lazily created SFTP subsystem channel, reused across file operations. */
+  sftp?: SFTPWrapper | undefined;
+  /** Cached remote home directory, used to expand "~" paths. */
+  homeDir?: string | undefined;
 }
 
 interface RawExecResult {
@@ -294,6 +303,59 @@ export class ConnectionManager {
       throw new Error(`No active SSH connection: ${sshId}`);
     }
     return publicConnection(connection);
+  }
+
+  /**
+   * Return a reusable SFTP subsystem channel for the connection. The channel is
+   * created on first use and dropped when it closes, so a reconnect or channel
+   * failure recovers automatically on the next file operation.
+   */
+  async sftp(sshId: string): Promise<SFTPWrapper> {
+    const connection = this.connections.get(sshId);
+    if (!connection) {
+      throw new Error(`No active SSH connection: ${sshId}`);
+    }
+    if (connection.sftp) return connection.sftp;
+
+    const wrapper = await new Promise<SFTPWrapper>((resolve, reject) => {
+      connection.client.sftp((error, sftp) => {
+        if (error) {
+          reject(asError(error));
+          return;
+        }
+        resolve(sftp);
+      });
+    });
+
+    connection.sftp = wrapper;
+    const invalidate = () => {
+      if (connection.sftp === wrapper) connection.sftp = undefined;
+    };
+    wrapper.once("close", invalidate);
+    wrapper.once("error", invalidate);
+    return wrapper;
+  }
+
+  /** Resolve and cache the remote user's home directory via SFTP. */
+  async homeDir(sshId: string): Promise<string> {
+    const connection = this.connections.get(sshId);
+    if (!connection) {
+      throw new Error(`No active SSH connection: ${sshId}`);
+    }
+    if (connection.homeDir) return connection.homeDir;
+
+    const sftp = await this.sftp(sshId);
+    const home = await new Promise<string>((resolve, reject) => {
+      sftp.realpath(".", (error, absolutePath) => {
+        if (error) {
+          reject(asError(error));
+          return;
+        }
+        resolve(absolutePath);
+      });
+    });
+    connection.homeDir = home;
+    return home;
   }
 
   async exec(input: ExecInput, signal?: AbortSignal): Promise<ExecResult> {

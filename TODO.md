@@ -72,6 +72,14 @@
 
 ### P2（低优先级）
 
+- [ ] **`ssh_patch`（统一 diff 应用）**
+  - 需要远端有 `patch` 或 `git apply`；建议先 `--dry-run` 再执行。
+  - 先观察 `ssh_edit` 是否够用，再决定是否值得新增工具。
+
+- [ ] **`ssh_transfer` 增强**
+  - 断点续传、远端到远端传输、传输进度。
+  - 需要新的状态存储和更多测试，暂不做。
+
 - [ ] **host_key_policy 仍是两步确认框**
   - 现在是“accept-new vs 其他” + “strict vs insecure” 两次确认，不是真正的三选项菜单。
   - 原因：select 对话框带过滤输入，用户不希望选择策略还要打字。
@@ -118,4 +126,6 @@
 - 2026-11：删除 `/ssh-connect-list` 和 `/ssh-profile-*` 别名；精简手动连接提示和 profile 展示。
 - 2026-11：`ssh_exec` 执行期间连接断开或通道无退出状态时明确报错，不再返回 `exit_code: unknown`。
 - 2026-11-13：真实 Linux 主机（root）手工回归通过：私钥与密码两种认证、基础执行、`cwd`/`env`、非 0 退出码、输出截断、sudo、profile 复用、`force_new`、失效 `ssh_id`、执行中断线报错、后台 job 模式。
+- 2026-11-13：新增远程文件工具 `ssh_read` / `ssh_write` / `ssh_edit` / `ssh_glob` / `ssh_grep` / `ssh_remove` / `ssh_transfer`；每条连接复用 SFTP session；写/编辑采用临时文件 + 原子替换，并处理 OpenSSH SFTP v3 不允许覆盖 rename 的问题（posix-rename 扩展 + 备份回滚兜底）。
+- 2026-11-13：文件工具在真实主机验证通过：读写、唯一匹配与歧义拒绝、覆盖保护、`glob`（find 回退）、`grep`（grep 回退）、二进制检测、截断、删除 `dry_run`/实际删除、上传下载。
 - 2026-11：`npm run typecheck`、`npm run test:smoke`、`npm run test:tui` 通过。
