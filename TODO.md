@@ -10,15 +10,6 @@
 
 ---
 
-## 进行中
-
-- [ ] **TUI 完整重启后回归验证**
-  - 必须完全退出 OpenCode TUI 再启动，`/reload` 不够。
-  - 验证 `/ssh-connect`、`/ssh-disconnect`、`/ssh-list`、`/ssh-profile`。
-  - 重点看：auth 和 host-key 选择只走确认框、不出现文本框；手动连接重复目标时的“复用 / 新建”；profile 只显示名称和 `user@host:port`。
-
----
-
 ## 待办
 
 ### P1
@@ -38,15 +29,6 @@
     - 长时间大流量命令（如几百 MB 输出）
   - 这些用例应沉淀成可选的真实主机测试脚本，而不是依赖手工。
 
-- [ ] **`idleTimeoutMs` 默认 0 的取舍**
-  - 当前空闲连接不会自动断开，直到 OpenCode 退出。
-  - 需要决定：保持默认不断开，还是给一个默认值（例如 30 分钟）并写进 README 选项表。
-
-- [ ] **profile 活跃状态是快照**
-  - `/ssh-connect`、`/ssh-profile` 的 `[active]` 只在打开菜单时计算一次。
-  - 菜单打开期间 agent 或其他窗口连接/断开，显示不会更新。
-  - 影响仅为显示层，实际连接由 `ConnectionManager` 复用兜底。
-
 ### P2（低优先级）
 
 - [ ] **`fleet_exec`：多机并发执行**
@@ -62,11 +44,6 @@
 - [ ] **`ssh_transfer` 增强**
   - 断点续传、远端到远端传输、传输进度。
   - 需要新的状态存储和更多测试，暂不做。
-
-- [ ] **host_key_policy 仍是两步确认框**
-  - 现在是“accept-new vs 其他” + “strict vs insecure” 两次确认，不是真正的三选项菜单。
-  - 原因：select 对话框带过滤输入，用户不希望选择策略还要打字。
-  - 预期：如果要单选，需要写自定义 JSX 对话框，一次展示 `accept-new` / `strict` / `insecure`。
 
 ### P3（最低）
 
@@ -90,6 +67,21 @@
   - 预期：改用 `ctx.storage` 的 key（如 `knownHosts`），保留现有 TOFU 校验逻辑；需要一次性迁移读取旧 JSON，读取成功后再删除或改名备份。
   - 不做也可以：功能正常，只是数据分散在两处。
 
+- [ ] **auth 和 host-key 选择确认框改进**
+  - 现状：认证方式用一次“密码 / 私钥”确认框；host-key 策略先用“accept-new / 其他”、再用“strict / insecure”两次确认，不是一次完整单选。
+  - 问题：用户需要连续确认两次，选项没有一次展示完整，容易误选，也不符合“选择只走确认框”的交互目标。
+  - 预期：用一个自定义单选对话框（或一次展示完整选项的 JSX 对话框），认证方式一次选择“密码 / 私钥”，host-key 一次选择 `accept-new` / `strict` / `insecure`。
+  - 原因：不能直接用现有 select，因为它带过滤输入；用户不希望选择策略还要打字。
+
+- [ ] **`idleTimeoutMs` 默认 0 的取舍**
+  - 当前空闲连接不会自动断开，直到 OpenCode 退出。
+  - 需要决定：保持默认不断开，还是给一个默认值（例如 30 分钟）并写进 README 选项表。
+
+- [ ] **profile 活跃状态是快照**
+  - `/ssh-connect`、`/ssh-profile` 的 `[active]` 只在打开菜单时计算一次。
+  - 菜单打开期间 agent 或其他窗口连接/断开，显示不会更新。
+  - 影响仅为显示层，实际连接由 `ConnectionManager` 复用兜底。
+
 ---
 
 ## 已完成
@@ -110,3 +102,17 @@
 - 2026-11：`npm run typecheck`、`npm run test:smoke`、`npm run test:tui` 通过。
 - 2026-11-13：TUI 调试日志不再硬编码项目路径：`OPENCODE_SSH_TUI_DEBUG=1` 写入插件数据目录（`OPENCODE_SSH_HOME` 或平台默认目录）下的 `tui-debug.log`，设为其他值则按路径写入。
 - 2026-11-13：Docker 容器级跟踪不作为工具功能：job 只跟踪宿主机进程，容器生命周期由 `docker ps` / `docker stop` 单独决定，工具描述、README、AGENTS.md 已划定职责。
+- 2026-11-13：TUI 完整重启后回归验证通过：`/ssh-connect`、`/ssh-disconnect`、`/ssh-list`、`/ssh-profile` 可用；auth 和 host-key 只走确认框；手动连接重复目标可选择“复用 / 新建”；profile 只显示名称和 `user@host:port`。
+- 2026-11-13：在工具描述、AGENTS.md、README 中明确 sudo 事实：保存 profile / 连接成功不校验 sudo，`sudo_password` 缺失不等于免密，密码错误只在执行 sudo 时暴露。
+- 2026-11-13：`ssh_exec` 输出改为有界清洗 + 头尾保留：清除 ANSI/OSC，合并 `\r`/退格，分别报告 stdout/stderr 原始字节、保留字节和截断状态。
+- 2026-11-13：`ssh_exec` 提供可选 pager/颜色守卫（`non_interactive: true` 注入 `PAGER`/`GIT_PAGER`/`SYSTEMD_PAGER=cat`、`NO_COLOR=1`、`TERM=dumb`）；默认不注入，保持原命令语义，工具描述提醒按需使用。
+- 2026-11-13：`ssh_exec` 失败增加结构化 metadata：`errorCode`、`retryable`、`hint`、`recommendedNextTool`、`executionMayHaveStarted`；权限拒绝仍保持工具错误。
+- 2026-11-13：`ssh_exec`、`ssh_connect`、`ssh_transfer` 增加有界进度上报（约 1 秒一次），最终结果只返回一次。
+- 2026-11-13：修复 profile add/edit 和 connection test 复用活跃连接的问题：测试连接强制 `forceNew`，只断开测试连接；避免新密码未被验证却保存，以及误断正在使用的连接。
+- 2026-11-13：profile 增加 `revision`：仅连接相关字段变化时递增；连接记录创建时的 revision 和认证指纹，复用前必须匹配；更新后旧连接标记 `stale` 但不中断，后续连接使用新凭据。
+- 2026-11-13：修复 `ssh_read` 大文件分段语义：新增 `byte_offset` 真字节分段，返回 byte range 和 `lineNumbers`；行 offset 超出已捕获前缀时明确报错并提示下一段 `byte_offset`。
+- 2026-11-13：修复 `ssh_glob` / `ssh_grep` 扫描回退：每个请求只选一个引擎，合法零结果不回退；权限/路径/命令错误直接返回；输出截断传递到 `truncated`；`find` 用 `-prune` 跳过忽略目录；rg grep 排除 `.git` / `node_modules`。
+- 2026-11-13：明确 `tty` 职责并统一 EOF：`tty:true` 只分配 PTY，不提供交互 stdin；所有命令写入 sudo 密码后立即关闭 stdin，避免 `cat`/`read`/输入提示挂到超时；工具描述、AGENTS、README 已限制其使用范围。
+- 2026-11-13：统一取消信号：`ssh_exec` abort 时发送远端 `KILL`；`ssh_glob` / `ssh_grep` 传递 AbortSignal；`ssh_transfer` 支持 signal、单文件临时文件 + 原子替换并在失败/取消时尽力清理。job 生命周期保持独立，不新增 `job_kill`。
+- 2026-11-13：`ssh_grep` 默认跳过隐藏项、`.git`、`node_modules`，新增 `include_hidden`；`ssh_write` / `ssh_edit` 拒绝 symlink，说明 mode/ownership/ACL/xattr 限制；`ssh_edit` 增加前后 SHA-256、`expected_sha256` 和 CRLF 精确匹配提示；`ssh_write` / `ssh_edit`、`ssh_read` 报告 line endings，CRLF 时警告。
+- 2026-11-13：文档与工具描述对齐：补齐 files/search/jobs/errors 分层、移除“不支持 SFTP”的过期限制、补齐 profile revision/stale、job 状态与 no job_kill、tty/pager/取消/读文件 hash/line endings 等风险提示；TUI 手动连接不再复用 stale 连接。

@@ -178,6 +178,33 @@ async function main() {
   reset();
   rawRpc = {
     profilesList: async () => ({ ok: true, data: [] }),
+    connectionsList: async () => ({
+      ok: true,
+      data: [{ ...connection, id: "ssh_stale", stale: true }],
+    }),
+    connectionsConnect: async (input: any) => {
+      lastConnectInput = input;
+      return { ok: true, data: connection };
+    },
+    sudoProbe: async () => ({
+      ok: true,
+      data: {
+        status: "password-ok",
+        mode: "password",
+        message: "The sudo password is valid.",
+      },
+    }),
+  };
+  selectAnswers = ["__manual__"];
+  promptAnswers = ["tester", "127.0.0.1", "2222", "secret", ""];
+  confirmAnswers = [true, true, false];
+  await run("opencode-ssh.connect");
+  assert.notEqual(lastConnectInput?.forceNew, true);
+  assert.ok(!toasts.some((message) => message.includes("复用已有连接")));
+
+  reset();
+  rawRpc = {
+    profilesList: async () => ({ ok: true, data: [] }),
     connectionsList: async () => ({ ok: true, data: [] }),
   };
   selectAnswers = ["list"];

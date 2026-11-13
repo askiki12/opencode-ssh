@@ -28,7 +28,11 @@ src/crypto.ts                 AES-256-GCM 加密（SecretBox）
 src/profiles.ts               profile CRUD + SQLite storage + 加密字段
 src/known-hosts.ts            TOFU 主机指纹校验
 src/ssh/command.ts            远端命令拼接、shell 引号、sudo 包装
-src/ssh/manager.ts            持久连接池、连接/断开/执行
+src/ssh/errors.ts             执行错误码与恢复提示
+src/ssh/manager.ts            持久连接池、连接/断开/执行、取消与超时
+src/ssh/files.ts              SFTP 文件读写、编辑、删除、传输
+src/ssh/search.ts             远端 glob/grep 与引擎回退
+src/ssh/jobs.ts               远端长任务注册表与进程组停止
 src/tools/definitions.ts      工具定义与返回格式化
 src/rpc.ts                    TUI 与 server 之间的 RPC 契约
 src/rpc-handlers.ts           RPC 实现（连接测试、profile 测试后再保存）
@@ -133,11 +137,11 @@ AGENTS.md                     Agent 使用约定（连接复用、profile、exec
 
 默认行为是**复用**：
 
-- 传入 `profile_id` 时，如果该 profile 的活跃连接已存在，直接返回原 `ssh_id`；
-- inline 连接时，如果同一 `user@host:port` 已有活跃连接，并且 sudo 密码兼容，也返回原 `ssh_id`；
+- 传入 `profile_id` 时，只有活跃连接的 `profile_revision` 与当前 profile 一致、认证材料指纹相同，才返回原 `ssh_id`；profile 更新后旧连接会标记 `stale`，不再复用；
+- inline 连接时，如果同一 `user@host:port` 已有活跃连接，并且认证材料指纹、host key policy 和 sudo 密码兼容，也返回原 `ssh_id`；
 - 复用时会标记 `reused: true`，模型不应在任务结束后断开这种共享连接。
 
-返回 `ssh_id`，例如 `ssh_1a2b3c4d5e6f`。
+返回 `ssh_id`，例如 `ssh_1a2b3c4d5e6f`。连接阶段会通过 `progress` 上报 `resolving` / `reading-key` / `handshake` / `ready` 状态。
 
 ```json
 { "profile_id": "prof_9f8e7d6c5b4a" }
@@ -161,7 +165,7 @@ AGENTS.md                     Agent 使用约定（连接复用、profile、exec
 
 ### 2.3 `ssh_list`
 
-无参数。列出活跃连接：`ssh_id`、`user@host:port`、认证方式、连接时间、空闲时间、是否 busy、最近错误。不会返回任何密码。
+无参数。列出活跃连接：`ssh_id`、`user@host:port`、认证方式、连接时间、空闲时间、是否 busy、最近错误；profile 连接还会显示 `revision`，profile 更新后的旧连接显示 `stale`。不会返回任何密码。
 
 模型在 `ssh_connect` 前应先调用 `ssh_list`，如果已有相同 `user@host:port` 的连接，直接复用其 `ssh_id`，不要重复创建。
 
@@ -176,8 +180,9 @@ AGENTS.md                     Agent 使用约定（连接复用、profile、exec
 | `cwd` | string | 执行前 `cd` 到该目录 |
 | `env` | object | 额外环境变量（string → string） |
 | `timeout_ms` | integer | 命令超时，默认 120000 |
-| `tty` | boolean | 分配远端 PTY |
-| `max_output_bytes` | integer | stdout / stderr 各自的最大捕获字节数 |
+| `tty` | boolean | 分配远端 PTY；不提供交互 stdin，写入可选 sudo 密码后关闭 |
+| `non_interactive` | boolean | 可选 pager/颜色守卫；默认 false，设为 true 才会注入 |
+| `max_output_bytes` | integer | stdout / stderr 各自保留的最大字节数 |
 
 行为说明：
 
@@ -189,24 +194,55 @@ AGENTS.md                     Agent 使用约定（连接复用、profile、exec
   ```
 
   密码通过 **stdin** 写入，不出现在远端进程命令行里；
+- 工具不会预先校验 sudo 密码；缺失或错误密码只在执行结果中体现，详见 2.11；
 - 当 sudo 报 “no tty present / a terminal is required” 时，会自动用 PTY 重试一次；
-- 非 sudo 命令会立即向 stdin 发送 EOF，避免 `cat` 之类的命令挂起；交互式命令请设置 `tty: true`；
+- 所有命令在写入可选 sudo 密码后立即向 stdin 发送 EOF，包括 `tty: true`；因此 `cat`、`read` 或交互提示会收到 EOF，不会一直挂起；
+- `tty: true` 只分配 PTY，不是持久交互式 shell，也没有 send-stdin 工具；它适用于需要 TTY 检测/颜色但不需要持续输入的命令，一次性输入请用 shell 重定向/管道；读 `/dev/tty` 的程序仍可能需要 `timeout_ms`；
+- 不默认注入 pager/颜色环境；对可能分页的命令（`git log`、`systemctl status`、`man`、`less`）设置 `non_interactive: true`，或通过 `env` 传 `PAGER=cat`、`GIT_PAGER=cat`、`SYSTEMD_PAGER=cat`、`NO_COLOR=1`、`TERM=dumb`；`env` 中的同名变量优先；
 - 命令失败（非 0 退出码）**不会**抛工具错误，而是把 `exit_code`、stdout、stderr 返回给模型，由模型自行判断；
+- stdout/stderr 会先清除 ANSI/OSC 控制序列，合并 `\r` 进度条和退格覆盖；
+- 输出超过 `max_output_bytes` 时保留开头和结尾、省略中间，并分别报告 stdout/stderr 的原始字节、保留字节和截断状态；这比只保留前 N 字节更容易看到末尾的构建/测试错误；
+- 命令执行超过约 1 秒时，通过 `progress` 上报有界的尾部输出、耗时和已接收字节；不会把每次进度都追加到最终结果；
+- 工具调用被取消时，`ssh_exec` 会尽力向远端发送 `KILL` 后关闭 channel；`ssh_glob` / `ssh_grep` / `ssh_transfer` 也会响应同一个取消信号；取消是 best-effort，副作用仍按 `executionMayHaveStarted` 判断；
+- 执行失败会抛出工具错误，并在 metadata 中提供 `errorCode`、`retryable`、`hint`、`recommendedNextTool`、`executionMayHaveStarted`；错误文本也会重复这些字段，方便只看到 message 的客户端（例如 Code Mode）；
+- `executionMayHaveStarted=true` 表示远端命令可能已经产生副作用（超时、断线、通道无退出状态、abort）。此时不要盲目重跑 migration、删除或部署命令，应先确认远端状态；
 - 连接在命令执行期间断开时，工具会直接报错（`SSH connection ... was lost while the command was running.`），不会返回含糊的 `exit_code: unknown`；
 - 通道关闭但没有收到退出状态时，同样视为异常并报错，避免模型误判为成功；
-- 输出超过上限会截断，并标记 `truncated: yes`。
+- 权限拒绝仍由 OpenCode 权限系统处理，不会被包装成普通执行结果。
+
+常见 `errorCode`：
+
+| errorCode | retryable | executionMayHaveStarted | 建议 |
+| --- | --- | --- | --- |
+| `SSH_NOT_CONNECTED` | yes | no | 调 `ssh_connect` 或复用 `ssh_list` 中的连接 |
+| `SSH_COMMAND_TIMEOUT` | yes | yes | 先确认远端状态；长任务改用 `ssh_job_start` |
+| `SSH_CONNECTION_LOST` | yes | yes | 重连后确认远端状态再重试 |
+| `SSH_CHANNEL_NO_EXIT` | yes | yes | 视为可能已执行，先核对结果 |
+| `SSH_COMMAND_ABORTED` | no | yes | 调用方主动中止；先确认远端状态 |
+| `SSH_CHANNEL_ERROR` | yes | 视阶段而定 | 检查连接后重试 |
+| `SSH_INVALID_INPUT` | no | no | 修正参数 |
+| `SSH_INTERNAL_ERROR` | no | no | 检查连接和插件状态 |
 
 返回示例：
 
 ```text
 exit_code: 0
 duration_ms: 83
-truncated: no
+stdout: 181 bytes, retained 181, truncated: no
+stderr: 0 bytes, retained 0, truncated: no
 
 [stdout]
 Linux web-01 6.8.0 ...
 [stderr]
 (empty)
+```
+
+输出被截断时会看到类似：
+
+```text
+stdout: 1048576 bytes, retained 262144, truncated: yes
+
+[... 786432 bytes omitted; showing beginning and end ...]
 ```
 
 sudo 示例（需要 profile 或连接上保存了 `sudo_password`）：
@@ -245,6 +281,8 @@ sudo 示例（需要 profile 或连接上保存了 `sudo_password`）：
 
 返回 `profile_id`，例如 `prof_9f8e7d6c5b4a`。
 
+> 该工具只写存储，不连接主机、不验证 sudo。`sudo_password` 为空只表示后续不发送密码，不能据此判断免密。详见 2.11。
+
 ### 2.6 `ssh_profile_update`（额外提供）
 
 为避免改密码必须“删除再添加”，额外提供更新工具。只更新传入的字段；删除 secret 使用 `clear_*`：
@@ -253,25 +291,29 @@ sudo 示例（需要 profile 或连接上保存了 `sudo_password`）：
 
 `password` 和 `private_key_path` 互斥：设置其中一个会清掉另一个的认证方式。
 
+连接相关字段变化会递增 profile revision，并把已有连接标记为 `stale`，但不会主动断开它们；详见 2.12。
+
 ### 2.7 `ssh_profile_remove`
 
 | 参数 | 类型 | 说明 |
 | --- | --- | --- |
 | `profile_id` | string | 要删除的 profile |
 
+删除 profile 不会断开已有连接；这些连接会被标记为 `stale`，已有任务可以继续。
+
 ### 2.8 `ssh_profile_list`
 
-无参数。列出 profile 的 id、名称、`user@host:port`、认证方式、私钥路径、是否有 sudo 密码、主机指纹策略。不会返回密码。
+无参数。列出 profile 的 id、名称、`user@host:port`、认证方式、私钥路径、是否有 sudo 密码、`revision`、主机指纹策略。不会返回密码。`sudo_password=yes` 只表示存了密码，不代表密码正确；`no` 也不代表一定免密，详见 2.11。
 
 ### 2.9 远程文件工具
 
 | 工具 | 用途 | 关键规则 |
 | --- | --- | --- |
-| `ssh_read` | 读取远端文件 | 带行号；`offset` / `limit`；二进制只报告不输出；默认 256KB |
-| `ssh_write` | 完整写入文件 | 原子写；自动建父目录；默认**不覆盖**，需 `overwrite: true` |
-| `ssh_edit` | 精确替换文本 | 默认要求唯一匹配，否则 `replace_all: true`；保留权限 |
-| `ssh_glob` | 按名字找文件 | `rg` → `find` → SFTP 遍历；默认跳过 `.git`、`node_modules`、隐藏项 |
-| `ssh_grep` | 按内容搜索 | 远端 `rg` → `grep`；**没有 SFTP 逐字节兜底** |
+| `ssh_read` | 读取远端文件 | 默认 256KB；`offset` 是行偏移，`byte_offset` 是字节分段；二进制只报告不输出 |
+| `ssh_write` | 完整写入文件 | 原子写；自动建父目录；默认**不覆盖**；拒绝 symlink；报告 line endings |
+| `ssh_edit` | 精确替换文本 | 默认要求唯一匹配；支持 `expected_sha256`；返回前后 SHA-256；拒绝 symlink |
+| `ssh_glob` | 按名字找文件 | 选择一个引擎：`rg` → `find` → SFTP；零结果不回退；默认跳过 `.git`、`node_modules`、隐藏项 |
+| `ssh_grep` | 按内容搜索 | 远端 `rg` → `grep`；零结果不回退；默认跳过隐藏项、`.git`、`node_modules`；**没有 SFTP 逐字节兜底** |
 | `ssh_remove` | 删除文件或目录 | 目录需 `recursive: true`；建议先 `dry_run: true` |
 | `ssh_transfer` | 本地 ↔ 远端传输 | `upload` / `download`；覆盖需 `overwrite: true`；拒绝符号链接 |
 
@@ -279,7 +321,16 @@ sudo 示例（需要 profile 或连接上保存了 `sudo_password`）：
 
 - 路径必须是绝对路径或 `~/...`；相对路径直接拒绝，因为 SFTP 和 exec 不共享工作目录。
 - 写、编辑、删除、传输使用路径级权限检查，resource 为 `user@host:/path`；读、glob、grep 不额外确认。
+- `ssh_read` 的 `offset` 是行偏移，只在从字节 0 读取的窗口内有效；读取大文件后半部分请用 `byte_offset`，此时行号不可用。字节截断提示会给出下一个 `byte_offset`，不会误导继续增大行偏移。
+- `ssh_write` / `ssh_edit` 会拒绝 symlink，避免原子替换把链接变成普通文件；需要编辑链接目标时，先解析真实路径并重新授权。`ssh_remove` 删除 symlink 时只删除链接本身，不删除目标。
+- `ssh_write` / `ssh_edit` 保留 POSIX mode，但原子替换会把 inode ownership 变为 SSH 用户，ACL/xattr 不保证保留。
+- `ssh_read` 会报告 `line_endings`；读取完整文件时还返回 SHA-256，可用于 `ssh_edit` 的 `expected_sha256`。分段读取时 `sha256` 为 null。
+- `ssh_edit` 支持 `expected_sha256`，并在结果中返回修改前后 SHA-256。匹配是精确的：CRLF 文件需要 `old_text` 包含 `\r\n`，工具会给出提示但不会做模糊匹配。
+- `ssh_write` 按字节原样写入并报告 `line_endings`；内容含 CRLF 时会警告，因为 Linux shell 脚本和 cron 条目通常要求 LF。
+- `ssh_grep` 默认跳过隐藏项、`.git`、`node_modules`；需要搜索隐藏项时设置 `include_hidden: true`。
 - `ssh_grep` / `ssh_glob` 依赖远端有 `rg`、`grep` 或 `find`；都没有时 `ssh_grep` 会明确报错，并提示可以用 `ssh_exec` 安装 ripgrep。
+- `ssh_glob` / `ssh_grep` 每个请求只选择一个搜索器；合法零结果不会触发下一层扫描。权限、路径或命令错误会直接返回，不会静默变成“无结果”；输出被截断时 `truncated: yes`。
+- `ssh_transfer` 会通过 `progress` 上报已传输字节和文件数（约 1 秒一次），最终结果只返回一次；单个文件先写临时文件再替换，失败或取消时尽力清理临时文件，目录传输仍可能留下部分已完成的子项。
 - 不建议用 `ssh_exec cat` 读大文件，也不建议把大文件传到本地再搜索。
 
 ### 2.10 长任务工具
@@ -313,7 +364,59 @@ sudo 示例（需要 profile 或连接上保存了 `sudo_password`）：
 - 环境变量直接写在命令里：`export FOO=bar && python train.py`；
 - 任务结束后用 `ssh_remove` 删除 `job_dir` 做清理；
 - 只支持 POSIX 远端；
+- job 的生命周期独立于工具调用和 SSH 连接；取消 `ssh_exec` 或断开连接不会停止 job。检测用 `ssh_job_status`，停止用 `ssh_job_stop`，不需要额外的 `job_kill`；
 - **只跟踪宿主机进程**：容器有独立生命周期。`docker run -d` 会立刻返回，`docker exec` 不随 job 停止，停止 job 也可能留下容器；是否继续或停止容器需另外决定（`docker ps` / `docker stop`）。
+
+### 2.11 sudo 密码的已知限制
+
+**插件不会在保存 profile 或建立连接时校验 sudo 密码。**
+
+- Agent 的 `ssh_profile_add` / `ssh_profile_update` 只写存储，不连接主机；
+- TUI `/ssh-profile add/edit` 只测试 SSH 登录，不测试 sudo；
+- `ssh_connect` 成功只代表 SSH 认证通过，不代表 sudo 可用。
+
+`sudo_password` 的语义：
+
+- 填了：加密保存，后续 `ssh_exec({ sudo: true })` 通过 stdin 发送；
+- 没填：后续 sudo 不发送密码。这对 NOPASSWD 用户是正确的，但插件无法区分“用户免密”和“用户漏填”。
+
+因此：
+
+- 保存 profile 成功、`ssh_connect` 成功，都不能推断“sudo 免密”或“sudo 密码正确”；
+- 密码错误或缺失，只有在真正执行 sudo 时才会暴露；
+- sudo 凭据缓存期内，错误密码也可能暂时执行成功；
+- `ssh_profile_list` 的 `sudo_password=yes` 只表示存了密码，不表示密码有效；`no` 也不代表一定免密。
+
+需要确认时：
+
+- 免密检查：`ssh_exec({ command: "sudo -k -n true" })`，退出码 0 表示无需密码（`-k` 忽略缓存）；
+- 密码是否正确：直接执行实际需要的 sudo 命令，读取 `exit_code` / stderr，或向用户确认；不要根据连接结果猜测。
+
+不自动检测的原因：保存 profile 需要支持离线配置；探测会额外建立连接、写 known_hosts、产生远端 auth 日志；NOPASSWD 和受限 sudoers 还容易误判。
+
+### 2.12 profile revision 与过期连接
+
+profile 有一个 `revision` 字段，只在**影响连接**的字段变化时递增：
+
+- `password`
+- `private_key_path` / `private_key_passphrase`
+- `sudo_password`
+- `host_key_policy`
+- `user` / `host` / `port`
+
+仅修改 profile 名称不会递增 revision。
+
+行为：
+
+- 连接创建时记录当时的 `profile_revision`；
+- 按 `profile_id` 复用前，要求 revision 一致，并比较认证材料指纹；
+- profile 更新后，旧连接被标记为 `stale`，但**不会主动断开**，正在执行的任务可以继续；
+- 再次 `ssh_connect` 会创建使用新凭据/新策略的连接；
+- `ssh_list` 会显示 `stale` 和 `revision`，TUI 的 `/ssh-list` 显示 `[stale]`；
+- `ssh_profile_list` 会显示当前 `revision`；
+- 旧连接需要时再用 `ssh_disconnect` 关闭。
+
+inline 连接复用也会比较认证材料指纹和 host key policy：同一 `user@host:port` 但密码/私钥不同，或策略不同，不会复用旧连接。
 
 ---
 
@@ -331,6 +434,8 @@ sudo 示例（需要 profile 或连接上保存了 `sudo_password`）：
 `ssh_job_start` 和 `ssh_job_stop` 使用主机级粒度（与 `ssh_exec` 相同），`ssh_job_status` 不额外确认。
 
 读、glob、grep 不触发额外确认。
+
+权限拒绝仍然作为工具错误返回，不会被包装成 `ssh_exec` 的普通结果或执行 metadata；`errorCode` 等字段只描述 SSH 执行层的失败。
 
 可以在 `opencode.json(c)` 中配置，例如生产机器执行前询问：
 
@@ -456,12 +561,14 @@ npm install
 
 | 指令 | 行为 |
 | --- | --- |
-| `/ssh-connect` | 直接打开选择框：列出 profile 和活跃连接；已连接的 profile 标记 `[active]` 并禁用；也可选择“手动输入新连接”。手动连接成功后会询问是否保存为 profile。手动输入的目标如果已经有活跃连接，会询问“复用”还是“新建”。 |
+| `/ssh-connect` | 直接打开选择框：列出 profile 和活跃连接；已连接的 profile 标记 `[active]` 并禁用（stale 连接不算 active）；也可选择“手动输入新连接”。手动连接成功后会询问是否保存为 profile。手动输入的目标如果已有非 stale 活跃连接，会询问“复用”还是“新建”。 |
 | `/ssh-disconnect` | 直接打开选择框，选择并断开活跃连接。 |
-| `/ssh-list` | 显示活跃连接列表，格式为 `name  user@host:port  idle=...`。 |
+| `/ssh-list` | 显示活跃连接列表，格式为 `name  user@host:port  idle=...`，stale 连接额外显示 `[stale]`。 |
 | `/ssh-profile` | 打开 Profile 管理菜单：add / remove / list / edit。选择 add 时先输入 profile 名称，再逐步输入 user / host / port / 密码或私钥 / sudo 密码 / 指纹策略；先测试连接，成功后才保存。选择 edit 时可修改名称、user、host、port、密码/私钥、sudo 密码；连接相关字段变化时先测试连接，测试成功才更新，失败不修改。仅改名时可直接更新，不要求主机在线。 |
 
 `/ssh-connect`、`/ssh-disconnect`、`/ssh-profile` 都不接受参数，执行后直接出现选择框/菜单。
+
+`/ssh-profile add/edit` 的测试连接始终新建独立连接，不会复用已有活跃连接；测试结束后也只断开这条测试连接，不影响正在使用的连接。更新连接相关字段后，旧连接会标记为 `stale` 并继续执行已有任务，但不会用于后续复用。
 
 Profile 的 `prof_...` 是内部 id，只用于 RPC/存储，不在列表和选择框中展示。选择 profile 时只显示名称和 `user@host:port`。
 
@@ -508,7 +615,7 @@ Profile 的 `prof_...` 是内部 id，只用于 RPC/存储，不在列表和选�
 - TUI 密码输入框不掩码；
 - TUI 部分基于 `@opencode/plugin` 2.2.7 的类型开发，运行环境版本差异需要实际验证；
 - sudo 密码脱敏只对长度 ≥ 4 的密码生效，极短密码在 PTY 回显场景仍有风险；
-- 不支持 SSH agent（Pageant / ssh-agent）、ProxyJump、端口转发、SFTP；
+- 不支持 SSH agent（Pageant / ssh-agent）、ProxyJump、端口转发；SFTP 仅实现文件读取/写入/编辑/删除/传输，不是完整的 OpenSSH SFTP 客户端；
 - 不支持 OTP / 2FA 的多轮 keyboard-interactive（当前把密码用于所有 prompt）；
 - 不读取 OpenSSH `~/.ssh/config` 和 `known_hosts`；
 - 每条 `ssh_exec` 是独立 channel，shell 状态不持久；
@@ -521,10 +628,10 @@ Profile 的 `prof_...` 是内部 id，只用于 RPC/存储，不在列表和选�
 1. profile 导出/导入（包含加密数据或重新加密）。
 2. 将 `known_hosts` 也迁移到 `ctx.storage`。
 3. 增加按命令内容的权限规则，而不仅是 `user@host:port`。
-4. 支持 SSH agent、ProxyJump、端口转发、SFTP。
+4. 支持 SSH agent、ProxyJump、端口转发。
 5. 评估持久交互式 shell。
 6. 为 TUI 增加掩码密码输入或自定义安全表单。
-7. 增加 timeout、密码脱敏、无 TTY 重试的自动化测试。
+7. 增加密码脱敏、无 TTY 重试等边界场景的自动化测试。
 
 ---
 

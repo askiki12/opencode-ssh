@@ -11,11 +11,12 @@ Use the `ssh_*` tools for work. The `/ssh-connect`, `/ssh-list`, `/ssh-profile` 
 1. Before connecting, call `ssh_list` when you need to know what is already active.
 2. `ssh_connect` already reuses an existing connection by default:
    - same `profile_id`, or
-   - same `user@host:port` for an inline connection when the sudo password is compatible.
+   - same `user@host:port` for an inline connection when authentication material, host-key policy, and sudo password are compatible.
    It returns the existing `ssh_id` with `reused: true`.
 3. Do not create a duplicate connection unless the user explicitly asks for a separate one. In that case pass `force_new: true`.
 4. If `ssh_connect` returns `reused: true`, do **not** call `ssh_disconnect` when your task finishes. Other work may still be using that connection.
 5. Only disconnect connections you created and no longer need.
+6. Profile reuse also requires the same `revision` and authentication material. After a password/key/sudo/host-key/user/host/port edit, old connections are marked `stale`: do not reuse them for new work, but do not disconnect them if they may still be running tasks.
 
 Recommended flow:
 
@@ -32,15 +33,22 @@ ssh_list
 - Use `ssh_profile_add` when the user wants to persist a reusable configuration.
 - Inline connections are for one-off work. Do not echo passwords or sudo passwords back to the user.
 - Profile ids are internal. When talking to the user, use the profile name and `user@host:port`, not the `prof_...` id.
+- `ssh_profile_update` and `ssh_profile_remove` do not disconnect active connections; they mark them stale. Existing work may continue, but reuse will create a fresh connection.
 
 ## Command execution
 
 - `ssh_exec` opens a new channel on an existing connection. Shell state such as `cd` and `export` does not persist between calls.
 - Use `cwd` for a working directory and `env` for per-command environment variables.
 - Use `sudo: true` for sudo. Use `as_user` to switch users. Sudo uses the password stored on the connection.
-- Set `timeout_ms` for long-running commands. Output is truncated by `max_output_bytes`.
+- `ssh_profile_add` / `ssh_profile_update` only write storage: they do not connect, verify credentials, or test sudo. A saved profile or successful `ssh_connect` proves SSH authentication only; never infer that sudo is passwordless or that the stored sudo password is correct.
+- Before using sudo without a stored sudo password, you may check passwordless access with `ssh_exec({ command: "sudo -k -n true" })` (exit code 0 means no password is needed). Otherwise run the real sudo command and read `exit_code` / stderr, or ask the user; do not guess.
+- Set `timeout_ms` for long-running commands. Output is bounded by `max_output_bytes`; terminal controls are stripped, and long output keeps both the beginning and the end. Check the separate stdout/stderr truncation fields.
+- Pager guards are opt-in: for commands that may page (`git log`, `systemctl status`, `man`, `less`), pass `non_interactive: true` or set `PAGER` / `GIT_PAGER` / `SYSTEMD_PAGER` to `cat`, `NO_COLOR=1`, `TERM=dumb` via `env`. By default commands keep their normal terminal behavior.
 - A non-zero exit code is normal command output, not a tool failure. Read `exit_code`, stdout, and stderr.
-- Avoid interactive commands unless `tty: true` is required.
+- On a tool failure, read `metadata.errorCode`, `retryable`, `hint`, `recommendedNextTool`, and `executionMayHaveStarted`. If `executionMayHaveStarted` is true, verify remote state before retrying; never blindly re-run migrations, deletes, or deployments.
+- Progress updates are bounded UI hints (tail output, elapsed time, transfer bytes); do not treat them as final output or poll for them.
+- Tool cancellation is best-effort: `ssh_exec` sends a remote KILL then closes the channel; `ssh_glob` / `ssh_grep` / `ssh_transfer` honor the tool signal. Cancelling a call does not stop a detached job; use `ssh_job_stop` for that.
+- `tty: true` only allocates a PTY; there is no send-stdin tool, and stdin closes immediately after an optional sudo password. Use it for TTY detection/color, not prompts or commands that read stdin. Use shell redirection/pipes for one-shot input.
 
 ## Remote file operations
 
@@ -58,11 +66,16 @@ Rules that matter:
 
 - Paths must be absolute or start with `~/`; relative paths are rejected.
 - `ssh_write` refuses to overwrite unless `overwrite: true` is passed deliberately.
+- `ssh_write` / `ssh_edit` refuse symbolic links. They preserve POSIX mode, but ownership may become the SSH user and ACL/xattr are not guaranteed. `ssh_transfer` rejects symlinks in both directions; `ssh_remove` deletes a link itself, not its target.
+- `ssh_write` reports `line_endings`; CRLF is written byte-for-byte and warned about. Use LF for Linux shell scripts and cron entries.
 - `ssh_edit` fails when `old_text` matches more than once unless `replace_all: true`.
+- `ssh_read` reports `line_endings` and, for a complete file, its SHA-256. Pass that hash as `ssh_edit`'s `expected_sha256` to prevent overwriting a file changed by another process. `ssh_edit` also returns SHA-256 before/after. Matching is exact, including CRLF.
 - Before deleting a directory, call `ssh_remove` with `dry_run: true`, then repeat with `recursive: true`.
 - Write, edit, remove, and transfer trigger a path-level permission prompt; read, glob, and grep do not.
 - `ssh_grep` / `ssh_glob` need `rg`, `grep`, or `find` on the remote. If both `rg` and `grep` are missing, tell the user and offer to install ripgrep via `ssh_exec` (ask before installing). Never fall back to reading every file over SFTP.
-- Do not download large files just to inspect them; use `ssh_read` with `offset` / `limit`.
+- `ssh_grep` skips hidden entries, `.git`, and `node_modules` by default; set `include_hidden: true` only when hidden files are actually needed.
+- Do not download large files just to inspect them. Use `ssh_read` with `offset` / `limit` for small files; for later parts of a large file use `byte_offset` and `max_bytes`. `offset` is a line offset only from byte 0, and line numbers are unavailable in a byte-offset window.
+- `ssh_glob` / `ssh_grep` choose one engine and do not fall back on a legitimate zero result. Treat `truncated: yes` as an incomplete result and surface permission/path/command errors instead of assuming "no matches".
 
 ## Long-running jobs
 
@@ -72,8 +85,8 @@ Use the job tools when a task should outlive one tool call (training, builds, mi
 - The job wraps a **foreground** command. If the command backgrounds itself (`nohup`, `&`, `docker run -d`), the job finishes immediately and tracks only the launcher — use `ssh_exec` and manage that process yourself instead.
 - Do **not** raise `ssh_exec`'s `timeout_ms` to hours. That holds a channel open and loses the result on disconnect.
 - `ssh_job_status` with `job_id` shows state, exit code, elapsed time; add `log_lines` to tail output. Call it without `job_id` to list all jobs.
-- States: `running`, `finished`, `stopped`, `lost` (process gone, no exit code), `corrupt`.
-- `ssh_job_stop` sends SIGTERM, then SIGKILL to the process group. It refuses when the pid no longer belongs to the job.
+- States: `starting`, `running`, `finished`, `stopped`, `lost` (process gone, no exit code), `corrupt`.
+- `ssh_job_stop` sends SIGTERM, then SIGKILL to the process group. It refuses when the pid no longer belongs to the job. There is no separate `job_kill`; cancelling a tool call or disconnecting does not stop a job.
 - Clean up finished jobs with `ssh_remove` on `job_dir` (use `dry_run` first).
 - Environment variables go inline: `export FOO=bar && python train.py`.
 - Jobs survive disconnect and reconnect; state lives under `~/.opencode-ssh/jobs/` on the remote.

@@ -52,6 +52,8 @@ interface StoredProfile {
   privateKeyPassphrase?: SealedSecret;
   sudoPassword?: SealedSecret;
   hostKeyPolicy: HostKeyPolicy;
+  /** Incremented only when a connection-affecting field changes. */
+  revision?: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -73,6 +75,7 @@ export interface PublicProfile {
   hasPrivateKeyPassphrase: boolean;
   hasSudoPassword: boolean;
   hostKeyPolicy: HostKeyPolicy;
+  revision: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -89,6 +92,7 @@ export interface ResolvedProfile {
   privateKeyPassphrase?: string;
   sudoPassword?: string;
   hostKeyPolicy: HostKeyPolicy;
+  revision: number;
 }
 
 export class ProfileStore {
@@ -172,6 +176,7 @@ export class ProfileStore {
         host,
         port,
         hostKeyPolicy,
+        revision: 1,
         createdAt: timestamp,
         updatedAt: timestamp,
       };
@@ -228,6 +233,21 @@ export class ProfileStore {
     return this.mutate((document) => {
       const profile = document.profiles.find((candidate) => candidate.id === id);
       if (!profile) throw new Error(`SSH profile not found: ${id}`);
+      const previousUser = profile.user;
+      const previousHost = profile.host;
+      const previousPort = profile.port;
+      const previousHostKeyPolicy = profile.hostKeyPolicy;
+      let connectionChanged =
+        patch.password !== undefined ||
+        patch.privateKeyPath !== undefined ||
+        patch.privateKeyPassphrase !== undefined ||
+        patch.sudoPassword !== undefined ||
+        (patch.clearPassword === true && profile.password !== undefined) ||
+        (patch.clearPrivateKeyPath === true &&
+          profile.privateKeyPath !== undefined) ||
+        (patch.clearPrivateKeyPassphrase === true &&
+          profile.privateKeyPassphrase !== undefined) ||
+        (patch.clearSudoPassword === true && profile.sudoPassword !== undefined);
 
       if (patch.name !== undefined) {
         const name = requiredText(patch.name, "name");
@@ -336,6 +356,17 @@ export class ProfileStore {
           `An equivalent SSH profile already exists: ${duplicate.name} ${duplicate.user}@${duplicate.host}:${duplicate.port}.`,
         );
       }
+      if (
+        previousUser !== profile.user ||
+        previousHost !== profile.host ||
+        previousPort !== profile.port ||
+        previousHostKeyPolicy !== profile.hostKeyPolicy
+      ) {
+        connectionChanged = true;
+      }
+      if (connectionChanged) {
+        profile.revision = (profile.revision ?? 0) + 1;
+      }
       profile.updatedAt = nowIso();
       return publicProfile(profile);
     });
@@ -362,6 +393,7 @@ export class ProfileStore {
       host: profile.host,
       port: profile.port,
       hostKeyPolicy: profile.hostKeyPolicy,
+      revision: profile.revision ?? 0,
     };
     if (profile.password) {
       resolved.password = this.box.open(
@@ -444,7 +476,11 @@ function isStoredProfile(value: unknown): value is StoredProfile {
     (profile.privateKeyPassphrase === undefined ||
       SecretBox.isSealed(profile.privateKeyPassphrase)) &&
     (profile.sudoPassword === undefined ||
-      SecretBox.isSealed(profile.sudoPassword))
+      SecretBox.isSealed(profile.sudoPassword)) &&
+    (profile.revision === undefined ||
+      (typeof profile.revision === "number" &&
+        Number.isInteger(profile.revision) &&
+        profile.revision >= 0))
   );
 }
 
@@ -489,6 +525,7 @@ function publicProfile(profile: StoredProfile): PublicProfile {
     hasPrivateKeyPassphrase: profile.privateKeyPassphrase !== undefined,
     hasSudoPassword: profile.sudoPassword !== undefined,
     hostKeyPolicy: profile.hostKeyPolicy,
+    revision: profile.revision ?? 0,
     createdAt: profile.createdAt,
     updatedAt: profile.updatedAt,
   };

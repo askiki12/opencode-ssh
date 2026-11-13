@@ -6,7 +6,17 @@ export interface BuildCommandInput {
   asUser?: string;
   /** The SSH login user; when root, sudo is unnecessary unless switching users. */
   loginUser: string;
+  /** Inject pager/color guards so the command cannot block on a pager. */
+  nonInteractive?: boolean;
 }
+
+const NON_INTERACTIVE_ENV: Readonly<Record<string, string>> = {
+  PAGER: "cat",
+  GIT_PAGER: "cat",
+  SYSTEMD_PAGER: "cat",
+  NO_COLOR: "1",
+  TERM: "dumb",
+};
 
 export interface BuiltCommand {
   command: string;
@@ -22,7 +32,11 @@ export function buildRemoteCommand(input: BuildCommandInput): BuiltCommand {
     throw new Error("command must not be empty.");
   }
 
-  const environment = Object.entries(input.env ?? {});
+  // User-provided env wins over the non-interactive defaults.
+  const environment = Object.entries({
+    ...(input.nonInteractive === true ? NON_INTERACTIVE_ENV : {}),
+    ...(input.env ?? {}),
+  });
   const exports = environment
     .map(([name, value]) => {
       if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {

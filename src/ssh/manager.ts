@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import ssh2 from "ssh2";
 import type {
@@ -25,8 +26,14 @@ import {
   looksLikeMissingTty,
   looksLikeSudoPasswordFailure,
 } from "./command.js";
+import { SshOperationError } from "./errors.js";
 
 const { Client } = ssh2;
+
+export interface ConnectProgress {
+  phase: "resolving" | "reading-key" | "handshake" | "ready";
+  message: string;
+}
 
 export interface ConnectInput {
   profileId?: string;
@@ -41,6 +48,8 @@ export interface ConnectInput {
   hostKeyPolicy?: HostKeyPolicy;
   /** Create a second connection even if an equivalent active connection exists. */
   forceNew?: boolean;
+  /** Optional handshake progress for the UI. */
+  onProgress?: (update: ConnectProgress) => void;
 }
 
 export interface ConnectionInfo {
@@ -52,6 +61,9 @@ export interface ConnectionInfo {
   port: number;
   authMethod: "password" | "privateKey";
   hostKeyFingerprint?: string;
+  profileRevision?: number;
+  /** True when the profile changed after this connection was established. */
+  stale?: boolean;
   connectedAt: string;
   lastUsedAt: string;
   idleMs: number;
@@ -71,6 +83,18 @@ export interface ExecInput {
   timeoutMs?: number;
   tty?: boolean;
   maxOutputBytes?: number;
+  /** Inject pager/color guards so the command cannot block on a pager. */
+  nonInteractive?: boolean;
+  /** Called at most about once per second with a bounded output snapshot. */
+  onProgress?: (update: ExecProgress) => void;
+}
+
+export interface ExecProgress {
+  elapsedMs: number;
+  stdoutTail: string;
+  stderrTail: string;
+  stdoutBytes: number;
+  stderrBytes: number;
 }
 
 export interface ExecResult {
@@ -81,6 +105,10 @@ export interface ExecResult {
   stderr: string;
   durationMs: number;
   truncated: boolean;
+  stdoutBytes?: number;
+  stderrBytes?: number;
+  stdoutTruncated?: boolean;
+  stderrTruncated?: boolean;
 }
 
 interface ActiveConnection {
@@ -93,6 +121,11 @@ interface ActiveConnection {
   port: number;
   authMethod: "password" | "privateKey";
   sudoPassword?: string;
+  /** In-memory digest of the authentication material, never the secret itself. */
+  authFingerprint?: string;
+  hostKeyPolicy?: HostKeyPolicy;
+  profileRevision?: number;
+  stale?: boolean;
   hostKeyFingerprint?: string;
   connectedAt: number;
   lastUsedAt: number;
@@ -110,6 +143,10 @@ interface RawExecResult {
   stdout: string;
   stderr: string;
   truncated: boolean;
+  stdoutBytes: number;
+  stderrBytes: number;
+  stdoutTruncated: boolean;
+  stderrTruncated: boolean;
 }
 
 interface ExecOnceOptions {
@@ -118,6 +155,7 @@ interface ExecOnceOptions {
   maxOutputBytes: number;
   usesSudo: boolean;
   signal?: AbortSignal;
+  onProgress?: (update: ExecProgress) => void;
 }
 
 export class ConnectionManager {
@@ -138,9 +176,32 @@ export class ConnectionManager {
 
   async connect(input: ConnectInput): Promise<ConnectionInfo> {
     const target = await this.resolveTarget(input);
+    const targetFingerprint = authFingerprint(target);
+    const reportProgress = (update: ConnectProgress) => {
+      try {
+        input.onProgress?.(update);
+      } catch {
+        // Progress reporting must never break the connection.
+      }
+    };
+    reportProgress({
+      phase: "resolving",
+      message: "Resolved the SSH target.",
+    });
     if (input.forceNew !== true) {
-      const reusable = this.findReusable(target, input.profileId);
+      const reusable = this.findReusable(
+        target,
+        input.profileId,
+        targetFingerprint,
+      );
       if (reusable) return publicConnection(reusable, true);
+    }
+
+    if (target.privateKeyPath) {
+      reportProgress({
+        phase: "reading-key",
+        message: "Reading the local private key.",
+      });
     }
 
     const privateKey = target.privateKeyPath
@@ -231,6 +292,10 @@ export class ConnectionManager {
         if (settled) return;
         settled = true;
         cleanup();
+        reportProgress({
+          phase: "ready",
+          message: "SSH authentication completed.",
+        });
         resolve();
       };
       const onError = (error: Error) => fail(asError(error));
@@ -247,6 +312,10 @@ export class ConnectionManager {
       client.once("close", onClose);
 
       try {
+        reportProgress({
+          phase: "handshake",
+          message: `Connecting to ${target.user}@${target.host}:${target.port}.`,
+        });
         client.connect(connectConfig);
       } catch (error) {
         fail(asError(error));
@@ -262,11 +331,18 @@ export class ConnectionManager {
       host: target.host,
       port: target.port,
       authMethod: privateKey !== undefined ? "privateKey" : "password",
+      hostKeyPolicy: target.hostKeyPolicy,
       connectedAt: timestamp,
       lastUsedAt: timestamp,
       busy: 0,
     };
-    if (target.id.length > 0) connection.profileId = target.id;
+    if (targetFingerprint !== undefined) {
+      connection.authFingerprint = targetFingerprint;
+    }
+    if (target.id.length > 0) {
+      connection.profileId = target.id;
+      connection.profileRevision = target.revision;
+    }
     if (target.sudoPassword !== undefined) {
       connection.sudoPassword = target.sudoPassword;
     }
@@ -297,10 +373,33 @@ export class ConnectionManager {
       .map((connection) => publicConnection(connection));
   }
 
+  /**
+   * Mark connections for a profile as stale without interrupting them. A stale
+   * connection keeps running in-flight work but is excluded from reuse.
+   */
+  markProfileStale(profileId: string, revision?: number): void {
+    for (const connection of this.connections.values()) {
+      if (connection.profileId !== profileId) continue;
+      if (
+        revision !== undefined &&
+        connection.profileRevision === revision
+      ) {
+        continue;
+      }
+      connection.stale = true;
+    }
+  }
+
   getInfo(sshId: string): ConnectionInfo {
     const connection = this.connections.get(sshId);
     if (!connection) {
-      throw new Error(`No active SSH connection: ${sshId}`);
+      throw new SshOperationError(`No active SSH connection: ${sshId}`, {
+        code: "SSH_NOT_CONNECTED",
+        retryable: true,
+        hint: "Call ssh_connect or reuse an active ssh_id from ssh_list.",
+        recommendedNextTool: "ssh_connect",
+        executionMayHaveStarted: false,
+      });
     }
     return publicConnection(connection);
   }
@@ -361,10 +460,29 @@ export class ConnectionManager {
   async exec(input: ExecInput, signal?: AbortSignal): Promise<ExecResult> {
     const connection = this.connections.get(input.sshId);
     if (!connection) {
-      throw new Error(`No active SSH connection: ${input.sshId}`);
+      throw new SshOperationError(
+        `No active SSH connection: ${input.sshId}`,
+        {
+          code: "SSH_NOT_CONNECTED",
+          retryable: true,
+          hint: "Call ssh_connect or reuse an active ssh_id from ssh_list.",
+          recommendedNextTool: "ssh_connect",
+          executionMayHaveStarted: false,
+        },
+      );
     }
 
-    const command = requireText(input.command, "command");
+    let command: string;
+    try {
+      command = requireText(input.command, "command");
+    } catch (error) {
+      throw new SshOperationError(errorMessage(error), {
+        code: "SSH_INVALID_INPUT",
+        retryable: false,
+        hint: "Provide a non-empty command and retry.",
+        executionMayHaveStarted: false,
+      });
+    }
     const timeoutMs = clamp(
       input.timeoutMs ?? this.config.execTimeoutMs,
       1_000,
@@ -375,14 +493,27 @@ export class ConnectionManager {
       1_024,
       16 * 1024 * 1024,
     );
-    const built = buildRemoteCommand({
-      command,
-      loginUser: connection.user,
-      ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
-      ...(input.env !== undefined ? { env: input.env } : {}),
-      ...(input.sudo !== undefined ? { sudo: input.sudo } : {}),
-      ...(input.asUser !== undefined ? { asUser: input.asUser } : {}),
-    });
+    let built;
+    try {
+      built = buildRemoteCommand({
+        command,
+        loginUser: connection.user,
+        ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
+        ...(input.env !== undefined ? { env: input.env } : {}),
+        ...(input.sudo !== undefined ? { sudo: input.sudo } : {}),
+        ...(input.asUser !== undefined ? { asUser: input.asUser } : {}),
+        ...(input.nonInteractive !== undefined
+          ? { nonInteractive: input.nonInteractive }
+          : {}),
+      });
+    } catch (error) {
+      throw new SshOperationError(errorMessage(error), {
+        code: "SSH_INVALID_INPUT",
+        retryable: false,
+        hint: "Fix the command, cwd, or env values and retry.",
+        executionMayHaveStarted: false,
+      });
+    }
 
     const startedAt = Date.now();
     connection.busy += 1;
@@ -394,6 +525,9 @@ export class ConnectionManager {
         maxOutputBytes,
         usesSudo: built.usesSudo,
         ...(signal !== undefined ? { signal } : {}),
+        ...(input.onProgress !== undefined
+          ? { onProgress: input.onProgress }
+          : {}),
       });
 
       if (
@@ -408,6 +542,9 @@ export class ConnectionManager {
           maxOutputBytes,
           usesSudo: true,
           ...(signal !== undefined ? { signal } : {}),
+          ...(input.onProgress !== undefined
+            ? { onProgress: input.onProgress }
+            : {}),
         });
       }
 
@@ -433,6 +570,10 @@ export class ConnectionManager {
         stderr,
         durationMs: Date.now() - startedAt,
         truncated: raw.truncated,
+        stdoutBytes: raw.stdoutBytes,
+        stderrBytes: raw.stderrBytes,
+        stdoutTruncated: raw.stdoutTruncated,
+        stderrTruncated: raw.stderrTruncated,
       };
       if (raw.signal !== undefined) result.signal = raw.signal;
       return result;
@@ -467,15 +608,37 @@ export class ConnectionManager {
       let settled = false;
       let stream: ClientChannel | undefined;
       let timer: NodeJS.Timeout | undefined;
+      let progressTimer: NodeJS.Timeout | undefined;
       let abortListener: (() => void) | undefined;
       let clientCloseListener: (() => void) | undefined;
       let exitCode: number | null = null;
       let signalName: string | undefined;
+      const startedAt = Date.now();
       const stdout = new OutputCollector(options.maxOutputBytes);
       const stderr = new OutputCollector(options.maxOutputBytes);
 
+      const reportProgress = () => {
+        if (settled || options.onProgress === undefined) return;
+        try {
+          const redact = (value: string) =>
+            options.usesSudo && connection.sudoPassword !== undefined
+              ? redactSecret(value, connection.sudoPassword)
+              : value;
+          options.onProgress({
+            elapsedMs: Date.now() - startedAt,
+            stdoutTail: redact(stdout.tailText(1_024)),
+            stderrTail: redact(stderr.tailText(1_024)),
+            stdoutBytes: stdout.rawBytes,
+            stderrBytes: stderr.rawBytes,
+          });
+        } catch {
+          // Progress reporting must never break the command itself.
+        }
+      };
+
       const cleanup = () => {
         if (timer !== undefined) clearTimeout(timer);
+        if (progressTimer !== undefined) clearInterval(progressTimer);
         if (abortListener !== undefined && options.signal !== undefined) {
           options.signal.removeEventListener("abort", abortListener);
         }
@@ -501,12 +664,33 @@ export class ConnectionManager {
       };
 
       if (options.signal !== undefined) {
-        abortListener = () => fail(new Error("SSH command aborted."));
+        abortListener = () => {
+          if (stream !== undefined) {
+            try {
+              stream.signal("KILL");
+            } catch {
+              // Channel may already be gone.
+            }
+          }
+          fail(
+            new SshOperationError("SSH command aborted.", {
+              code: "SSH_COMMAND_ABORTED",
+              retryable: false,
+              hint: "The caller aborted the command. Check the remote state before retrying.",
+              executionMayHaveStarted: true,
+            }),
+          );
+        };
         if (options.signal.aborted) {
           abortListener();
           return;
         }
         options.signal.addEventListener("abort", abortListener, { once: true });
+      }
+
+      if (options.onProgress !== undefined) {
+        progressTimer = setInterval(reportProgress, 1_000);
+        progressTimer.unref();
       }
 
       const execOptions = options.tty
@@ -523,7 +707,18 @@ export class ConnectionManager {
             // Channel may already be gone.
           }
         }
-        fail(new Error(`SSH command timed out after ${options.timeoutMs} ms.`));
+        fail(
+          new SshOperationError(
+            `SSH command timed out after ${options.timeoutMs} ms.`,
+            {
+              code: "SSH_COMMAND_TIMEOUT",
+              retryable: true,
+              hint: "The remote command may still be running or may have produced side effects. Check remote state before retrying; use ssh_job_start for long tasks or raise timeout_ms.",
+              recommendedNextTool: "ssh_job_start",
+              executionMayHaveStarted: true,
+            },
+          ),
+        );
       }, options.timeoutMs);
       timer.unref();
 
@@ -532,9 +727,16 @@ export class ConnectionManager {
       // receive a misleading "exit_code: unknown".
       clientCloseListener = () => {
         fail(
-          new Error(
+          new SshOperationError(
             `SSH connection to ${connection.user}@${connection.host}:${connection.port} ` +
               "was lost while the command was running.",
+            {
+              code: "SSH_CONNECTION_LOST",
+              retryable: true,
+              hint: "Reconnect with ssh_connect, then verify remote state before retrying destructive commands.",
+              recommendedNextTool: "ssh_connect",
+              executionMayHaveStarted: true,
+            },
           ),
         );
       };
@@ -547,7 +749,15 @@ export class ConnectionManager {
             return;
           }
           if (error) {
-            fail(asError(error));
+            fail(
+              new SshOperationError(errorMessage(error), {
+                code: "SSH_CHANNEL_ERROR",
+                retryable: true,
+                hint: "The channel could not be opened. Reconnect if the problem persists.",
+                recommendedNextTool: "ssh_connect",
+                executionMayHaveStarted: false,
+              }),
+            );
             return;
           }
 
@@ -562,26 +772,47 @@ export class ConnectionManager {
             finish(() => {
               if (exitCode === null && signalName === undefined) {
                 reject(
-                  new Error(
+                  new SshOperationError(
                     "SSH command ended without an exit status; the connection to " +
                       `${connection.user}@${connection.host}:${connection.port} ` +
                       "may have dropped.",
+                    {
+                      code: "SSH_CHANNEL_NO_EXIT",
+                      retryable: true,
+                      hint: "Reconnect and verify remote state before retrying; the command may have run.",
+                      recommendedNextTool: "ssh_connect",
+                      executionMayHaveStarted: true,
+                    },
                   ),
                 );
                 return;
               }
+              stdout.end();
+              stderr.end();
               const result: RawExecResult = {
                 exitCode,
                 stdout: stdout.text(),
                 stderr: stderr.text(),
                 truncated: stdout.truncated || stderr.truncated,
+                stdoutBytes: stdout.rawBytes,
+                stderrBytes: stderr.rawBytes,
+                stdoutTruncated: stdout.truncated,
+                stderrTruncated: stderr.truncated,
               };
               if (signalName !== undefined) result.signal = signalName;
               resolve(result);
             }),
           );
           channel.on("error", (channelError: Error) =>
-            fail(asError(channelError)),
+            fail(
+              new SshOperationError(errorMessage(channelError), {
+                code: "SSH_CHANNEL_ERROR",
+                retryable: true,
+                hint: "The channel failed while the command was running. Check remote state before retrying.",
+                recommendedNextTool: "ssh_connect",
+                executionMayHaveStarted: true,
+              }),
+            ),
           );
 
           if (options.usesSudo && connection.sudoPassword !== undefined) {
@@ -589,15 +820,21 @@ export class ConnectionManager {
               `${connection.sudoPassword.replace(/[\r\n]+$/, "")}\n`,
             );
           }
-          if (
-            !options.tty ||
-            (options.usesSudo && connection.sudoPassword === undefined)
-          ) {
-            channel.end();
-          }
+          // There is no send-stdin tool, so a PTY is only useful for commands
+          // that need a terminal but no further input. Always close stdin;
+          // otherwise `read`, `cat`, or an input prompt hangs until timeout.
+          channel.end();
         });
       } catch (error) {
-        fail(asError(error));
+        fail(
+          new SshOperationError(errorMessage(error), {
+            code: "SSH_CHANNEL_ERROR",
+            retryable: true,
+            hint: "The channel could not be opened. Reconnect if the problem persists.",
+            recommendedNextTool: "ssh_connect",
+            executionMayHaveStarted: false,
+          }),
+        );
       }
     });
   }
@@ -619,15 +856,37 @@ export class ConnectionManager {
   private findReusable(
     target: ResolvedProfile,
     profileId: string | undefined,
+    targetFingerprint: string | undefined,
   ): ActiveConnection | undefined {
     for (const connection of this.connections.values()) {
+      if (connection.stale === true) continue;
+
       if (profileId !== undefined) {
         if (connection.profileId !== profileId) continue;
+        if (connection.profileRevision !== target.revision) {
+          // Leave the old connection intact for in-flight work, but never
+          // reuse it for the updated profile.
+          connection.stale = true;
+          continue;
+        }
       } else if (
         target.sudoPassword !== undefined &&
         connection.sudoPassword !== target.sudoPassword
       ) {
         // Reusing would silently use a different sudo password.
+        continue;
+      }
+
+      if (
+        targetFingerprint !== undefined &&
+        connection.authFingerprint !== targetFingerprint
+      ) {
+        // The same target with different authentication material must not
+        // silently reuse the old session.
+        continue;
+      }
+      if (connection.hostKeyPolicy !== target.hostKeyPolicy) {
+        // A new host-key policy must be applied by a fresh handshake.
         continue;
       }
 
@@ -686,6 +945,7 @@ export class ConnectionManager {
         input.hostKeyPolicy,
         this.config.hostKeyPolicy,
       ),
+      revision: 0,
     };
     if (password !== undefined) target.password = password;
     if (privateKeyPath !== undefined) target.privateKeyPath = privateKeyPath;
@@ -697,6 +957,25 @@ export class ConnectionManager {
     }
     return target;
   }
+}
+
+function authFingerprint(target: ResolvedProfile): string | undefined {
+  if (target.password !== undefined) {
+    return digest(`password\u0000${target.password}`);
+  }
+  if (target.privateKeyPath !== undefined) {
+    const keyPath = expandPath(target.privateKeyPath);
+    const normalized =
+      process.platform === "win32" ? keyPath.toLowerCase() : keyPath;
+    return digest(
+      `key\u0000${normalized}\u0000${target.privateKeyPassphrase ?? ""}`,
+    );
+  }
+  return undefined;
+}
+
+function digest(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
 function publicConnection(
@@ -717,6 +996,10 @@ function publicConnection(
   };
   if (reused) info.reused = true;
   if (connection.profileId !== undefined) info.profileId = connection.profileId;
+  if (connection.profileRevision !== undefined) {
+    info.profileRevision = connection.profileRevision;
+  }
+  if (connection.stale === true) info.stale = true;
   if (connection.hostKeyFingerprint !== undefined) {
     info.hostKeyFingerprint = connection.hostKeyFingerprint;
   }

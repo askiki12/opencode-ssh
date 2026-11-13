@@ -1,3 +1,4 @@
+import { Error as ToolError } from "@opencode/plugin/promise/tool";
 import type { ResolvedConfig } from "../config.js";
 import type { ProfileStore } from "../profiles.js";
 import {
@@ -14,8 +15,10 @@ import type { ReadRemoteFileResult } from "../ssh/files.js";
 import type {
   ConnectionInfo,
   ConnectionManager,
+  ExecInput,
   ExecResult,
 } from "../ssh/manager.js";
+import { SshOperationError } from "../ssh/errors.js";
 import type { JobInfo, JobService } from "../ssh/jobs.js";
 import type { SearchService } from "../ssh/search.js";
 import { errorMessage } from "../util.js";
@@ -107,7 +110,7 @@ const CONNECT_INPUT = {
     sudo_password: {
       type: "string",
       description:
-        "Password used when ssh_exec requests sudo or switches users. Stored encrypted in a profile, or kept in memory for an inline connection.",
+        "Password used when ssh_exec requests sudo or switches users. Stored encrypted in a profile, or kept in memory for an inline connection. Connecting does not verify it; a wrong or missing password only shows up when sudo actually runs.",
     },
     host_key_policy: HOST_KEY_POLICY_SCHEMA,
     force_new: {
@@ -152,7 +155,7 @@ const EXEC_INPUT = {
     sudo: {
       type: "boolean",
       description:
-        "Run through sudo, using the connection's sudo password when one is available.",
+        "Run through sudo, using the connection's sudo password when one is available. If none is stored, sudo only works when the remote policy is passwordless (NOPASSWD); missing or incorrect passwords appear in exit_code/stderr.",
     },
     as_user: {
       type: "string",
@@ -177,14 +180,19 @@ const EXEC_INPUT = {
     tty: {
       type: "boolean",
       description:
-        "Allocate a remote PTY. Use for commands that require a terminal; sudo is retried with a PTY automatically when needed.",
+        "Allocate a remote PTY for commands that require a terminal but no continuous input. stdin is closed immediately after an optional sudo password; interactive prompts or commands that read stdin will receive EOF. Use shell redirection for one-shot input; sudo is retried with a PTY automatically when needed.",
+    },
+    non_interactive: {
+      type: "boolean",
+      description:
+        "Optional pager/color guard. Set true for commands that may page (git log, systemctl status, man, less): injects PAGER=cat, GIT_PAGER=cat, SYSTEMD_PAGER=cat, NO_COLOR=1, and TERM=dumb. Default false so commands keep their normal terminal behavior.",
     },
     max_output_bytes: {
       type: "integer",
       minimum: 1024,
       maximum: 16777216,
       description:
-        "Maximum bytes captured from each of stdout and stderr. Output beyond this is truncated.",
+        "Maximum bytes retained from each of stdout and stderr. Terminal control sequences are stripped; when output exceeds the limit, the beginning and end are kept and the middle is omitted.",
     },
   },
   required: ["ssh_id", "command"],
@@ -208,7 +216,14 @@ const READ_INPUT = {
     offset: {
       type: "integer",
       minimum: 1,
-      description: "First line to return, 1-based. Defaults to 1.",
+      description:
+        "First line to return, 1-based. Only valid when reading from byte 0; use byte_offset for later parts of a large file.",
+    },
+    byte_offset: {
+      type: "integer",
+      minimum: 0,
+      description:
+        "0-based byte offset for a true segment read. Mutually exclusive with offset; line numbers are unavailable when non-zero.",
     },
     limit: {
       type: "integer",
@@ -219,7 +234,7 @@ const READ_INPUT = {
       type: "integer",
       minimum: 1024,
       maximum: MAX_READ_BYTES,
-      description: `Maximum bytes to read from the file. Defaults to ${DEFAULT_READ_BYTES}.`,
+      description: `Maximum bytes to read. Defaults to ${DEFAULT_READ_BYTES}. With byte_offset this is the window size.`,
     },
   },
   required: ["ssh_id", "path"],
@@ -269,6 +284,12 @@ const EDIT_INPUT = {
       type: "boolean",
       description: "Replace every occurrence instead of requiring a unique match.",
     },
+    expected_sha256: {
+      type: "string",
+      pattern: "^[0-9a-fA-F]{64}$",
+      description:
+        "Optional SHA-256 of the current file. The edit is rejected if the file changed after you read it.",
+    },
   },
   required: ["ssh_id", "path", "old_text", "new_text"],
   additionalProperties: false,
@@ -288,7 +309,8 @@ const GLOB_INPUT = {
     },
     path: {
       type: "string",
-      description: "Directory to search. Defaults to the remote home directory.",
+      description:
+        "Directory to search; absolute or ~/..., defaults to the remote home directory.",
     },
     max_results: {
       type: "integer",
@@ -318,7 +340,8 @@ const GREP_INPUT = {
     },
     path: {
       type: "string",
-      description: "File or directory to search. Defaults to the remote home directory.",
+      description:
+        "File or directory to search; absolute or ~/..., defaults to the remote home directory.",
     },
     include: {
       type: "string",
@@ -331,6 +354,11 @@ const GREP_INPUT = {
     case_sensitive: {
       type: "boolean",
       description: "Case-sensitive matching. Defaults to true.",
+    },
+    include_hidden: {
+      type: "boolean",
+      description:
+        "Include hidden files and directories. Defaults to false; .git and node_modules are always excluded.",
     },
     max_matches: {
       type: "integer",
@@ -491,7 +519,7 @@ const PROFILE_ADD_INPUT = {
     sudo_password: {
       type: "string",
       description:
-        "Password used for sudo and user switching. Encrypted at rest.",
+        "Optional password used for sudo and user switching. Encrypted at rest, but not verified when the profile is saved. If omitted, later sudo calls send no password; this works for NOPASSWD but is indistinguishable from a missing password.",
     },
     host_key_policy: HOST_KEY_POLICY_SCHEMA,
   },
@@ -518,7 +546,11 @@ const PROFILE_UPDATE_INPUT = {
         "New private key path. Replaces password authentication.",
     },
     private_key_passphrase: { type: "string" },
-    sudo_password: { type: "string" },
+    sudo_password: {
+      type: "string",
+      description:
+        "New sudo password. Stored encrypted but not verified by this tool; a wrong password is only detected when sudo runs.",
+    },
     host_key_policy: HOST_KEY_POLICY_SCHEMA,
     clear_password: { type: "boolean" },
     clear_private_key_path: { type: "boolean" },
@@ -548,13 +580,16 @@ export function createSshTools(
       name: "connect",
       description:
         "Get or create a persistent SSH connection and return an ssh_id for later ssh_exec calls. " +
-        "By default this tool REUSES an active connection for the same profile, or the same user@host:port when the sudo password is compatible, and returns the existing ssh_id. " +
+        "By default this tool REUSES an active connection when the profile or inline target matches and authentication material, host-key policy, and sudo password are compatible, and returns the existing ssh_id. " +
         "Call ssh_list first if you need to inspect active connections. " +
         "Pass force_new=true only when the user explicitly wants a separate connection. " +
-        "Provide either profile_id or inline user/host plus exactly one of password or private_key_path.",
+        "Provide either profile_id or inline user/host plus exactly one of password or private_key_path. " +
+        "A successful connect verifies SSH authentication only; it does not test sudo. " +
+        "A missing sudo_password does not prove passwordless sudo, and a wrong password is not detected until sudo runs. " +
+        "Reuse also requires the same profile revision; after a connection-affecting profile change, a new connection is created and the old one is marked stale instead of being interrupted.",
       input: CONNECT_INPUT,
       options: { namespace: "ssh", codemode: true },
-      execute: async (raw) => {
+      execute: async (raw, context) => {
         const input = asRecord(raw);
         const profileId = optionalString(input.profile_id);
         const user = optionalString(input.user);
@@ -614,6 +649,15 @@ export function createSshTools(
           ...(input.force_new !== undefined
             ? { forceNew: requireBoolean(input.force_new, "force_new") }
             : {}),
+          onProgress: (update) => {
+            void context
+              .progress({
+                type: "ssh.connect.progress",
+                phase: update.phase,
+                message: update.message,
+              })
+              .catch(() => undefined);
+          },
         });
 
         return {
@@ -653,7 +697,7 @@ export function createSshTools(
       description:
         "List active persistent SSH connections and their ssh_id values. " +
         "Reuse an existing ssh_id with ssh_exec instead of creating a duplicate connection. " +
-        "Secrets and passwords are never included.",
+        "Secrets and passwords are never included. A listed connection does not imply that its sudo password is present or valid. Connections marked stale belong to an older profile revision: they keep running in-flight work but are not reused.",
       input: LIST_INPUT,
       options: { namespace: "ssh", codemode: true },
       execute: async () => {
@@ -675,6 +719,10 @@ export function createSshTools(
             `idle=${formatDuration(connection.idleMs)}`,
           ];
           if (connection.profileId) bits.push(`profile=${connection.profileId}`);
+          if (connection.profileRevision !== undefined) {
+            bits.push(`revision=${connection.profileRevision}`);
+          }
+          if (connection.stale) bits.push("stale");
           if (connection.busy) bits.push("busy");
           if (connection.lastError) bits.push(`last_error=${connection.lastError}`);
           lines.push(bits.join("  "));
@@ -692,15 +740,29 @@ export function createSshTools(
         "Execute a command over a persistent SSH connection. Returns the exit code, stdout, and stderr. " +
         "Use an ssh_id from ssh_connect or ssh_list; prefer reusing an existing connection instead of connecting again. " +
         "Each call opens a new channel, so shell state such as cd/export does not persist; use cwd and env instead. " +
+        "tty=true allocates a PTY but does not provide interactive stdin; stdin closes immediately, so use it for TTY detection/color, not for prompts. " +
         "Set sudo=true to run through sudo, or as_user to switch users. " +
-        "sudo uses the sudo password stored on the connection; the password is written to sudo's stdin, never to the command line.",
+        "sudo uses the sudo password stored on the connection; the password is written to sudo's stdin, never to the command line. " +
+        "The tool does not pre-check sudo: a missing password may still work (NOPASSWD) or fail, and a wrong password is only visible in exit_code/stderr. " +
+        "Terminal control sequences are stripped; long output keeps both the beginning and the end, with separate stdout/stderr byte and truncation counts. " +
+        "Pager/color guards are not injected by default; for pager-prone commands set non_interactive=true or pass PAGER/GIT_PAGER/SYSTEMD_PAGER=cat, NO_COLOR=1, and TERM=dumb via env. " +
+        "On a tool failure, metadata includes errorCode, retryable, hint, recommendedNextTool, and executionMayHaveStarted; if executionMayHaveStarted is true, verify remote state before retrying. " +
+        "Caller cancellation is best-effort: the remote command may still have started, so check executionMayHaveStarted. " +
+        "A non-zero exit code is normal command output, not a tool failure.",
       input: EXEC_INPUT,
       options: { namespace: "ssh", codemode: true },
       execute: async (raw, context) => {
         const input = asRecord(raw);
-        const sshId = requireString(input.ssh_id, "ssh_id");
-        const command = requireString(input.command, "command");
-        const connection = dependencies.manager.getInfo(sshId);
+        let sshId: string;
+        let command: string;
+        let connection: ConnectionInfo;
+        try {
+          sshId = requireString(input.ssh_id, "ssh_id");
+          command = requireString(input.command, "command");
+          connection = dependencies.manager.getInfo(sshId);
+        } catch (error) {
+          throw toToolError(error, "SSH_INVALID_INPUT");
+        }
 
         if (dependencies.assertPermission) {
           await dependencies.assertPermission({
@@ -712,8 +774,9 @@ export function createSshTools(
           });
         }
 
-        const result = await dependencies.manager.exec(
-          {
+        let execInput: ExecInput;
+        try {
+          execInput = {
             sshId,
             command,
             ...(input.sudo !== undefined
@@ -734,6 +797,22 @@ export function createSshTools(
             ...(input.tty !== undefined
               ? { tty: requireBoolean(input.tty, "tty") }
               : {}),
+            nonInteractive:
+              input.non_interactive === undefined
+                ? false
+                : requireBoolean(input.non_interactive, "non_interactive"),
+            onProgress: (update) => {
+              void context
+                .progress({
+                  type: "ssh.exec.progress",
+                  elapsedMs: update.elapsedMs,
+                  stdoutBytes: update.stdoutBytes,
+                  stderrBytes: update.stderrBytes,
+                  stdoutTail: update.stdoutTail,
+                  stderrTail: update.stderrTail,
+                })
+                .catch(() => undefined);
+            },
             ...(input.max_output_bytes !== undefined
               ? {
                   maxOutputBytes: requireInteger(
@@ -742,9 +821,17 @@ export function createSshTools(
                   ),
                 }
               : {}),
-          },
-          context.signal,
-        );
+          };
+        } catch (error) {
+          throw toToolError(error, "SSH_INVALID_INPUT");
+        }
+
+        let result: ExecResult;
+        try {
+          result = await dependencies.manager.exec(execInput, context.signal);
+        } catch (error) {
+          throw toToolError(error);
+        }
 
         return {
           content: formatExec(result),
@@ -754,8 +841,12 @@ export function createSshTools(
             signal: result.signal,
             durationMs: result.durationMs,
             truncated: result.truncated,
-            stdoutBytes: Buffer.byteLength(result.stdout, "utf8"),
-            stderrBytes: Buffer.byteLength(result.stderr, "utf8"),
+            stdoutBytes: result.stdoutBytes,
+            stderrBytes: result.stderrBytes,
+            stdoutRetainedBytes: Buffer.byteLength(result.stdout, "utf8"),
+            stderrRetainedBytes: Buffer.byteLength(result.stderr, "utf8"),
+            stdoutTruncated: result.stdoutTruncated,
+            stderrTruncated: result.stderrTruncated,
           },
         };
       },
@@ -764,8 +855,9 @@ export function createSshTools(
     {
       name: "read",
       description:
-        "Read a remote file with line numbers. Prefer this over ssh_exec with cat for inspecting files: " +
-        "it is binary-safe, supports offset/limit, and caps how many bytes are returned.",
+        "Read a remote file. Prefer this over ssh_exec with cat for inspecting files: it is binary-safe, caps how many bytes are returned, and reports the exact byte range. " +
+        "When the whole file is read, it also returns its SHA-256 for use with ssh_edit's expected_sha256, and always reports line endings (CRLF can break Linux scripts/cron). " +
+        "offset is a 1-based line offset only valid when reading from byte 0; for later parts of a large file use byte_offset (0-based), where line numbers are unavailable.",
       input: READ_INPUT,
       options: { namespace: "ssh", codemode: true },
       execute: async (raw) => {
@@ -781,6 +873,9 @@ export function createSshTools(
           ...(input.offset !== undefined
             ? { offset: requireInteger(input.offset, "offset") }
             : {}),
+          ...(input.byte_offset !== undefined
+            ? { byteOffset: requireInteger(input.byte_offset, "byte_offset") }
+            : {}),
           ...(input.limit !== undefined
             ? { limit: requireInteger(input.limit, "limit") }
             : {}),
@@ -794,6 +889,11 @@ export function createSshTools(
           metadata: {
             path: result.path,
             size: result.size,
+            byteStart: result.byteStart,
+            byteEnd: result.byteEnd,
+            lineNumbers: result.lineNumbers,
+            sha256: result.sha256,
+            lineEndings: result.lineEndings,
             startLine: result.startLine,
             endLine: result.endLine,
             totalLines: result.totalLines,
@@ -810,7 +910,8 @@ export function createSshTools(
         "Write a complete remote file as UTF-8 using an atomic temp-file rename. " +
         "Parent directories are created automatically. " +
         "By default an existing file is an error; pass overwrite: true to replace it, " +
-        "or use ssh_edit for a targeted change.",
+        "or use ssh_edit for a targeted change. Content is written byte-for-byte: line endings are preserved and reported; CRLF may break Linux scripts/cron. " +
+        "POSIX mode is preserved; ownership may become the SSH user, and ACL/xattr are not guaranteed. Refuses symbolic links.",
       input: WRITE_INPUT,
       options: { namespace: "ssh", codemode: true },
       execute: async (raw, context) => {
@@ -835,12 +936,20 @@ export function createSshTools(
           },
         );
 
+        const lines = [
+          result.created ? "Created remote file." : "Overwrote remote file.",
+          `path: ${result.path}`,
+          `bytes: ${result.bytes}`,
+          `line_endings: ${result.lineEndings}`,
+        ];
+        if (result.lineEndings === "crlf" || result.lineEndings === "mixed") {
+          lines.push(
+            "",
+            "[warning] Content contains CRLF or mixed line endings; Linux scripts and cron entries usually require LF.",
+          );
+        }
         return {
-          content: [
-            result.created ? "Created remote file." : "Overwrote remote file.",
-            `path: ${result.path}`,
-            `bytes: ${result.bytes}`,
-          ].join("\n"),
+          content: lines.join("\n"),
           metadata: { ...result },
         };
       },
@@ -849,9 +958,11 @@ export function createSshTools(
     {
       name: "edit",
       description:
-        "Replace exact text in a remote file and write it atomically, preserving permissions. " +
+        "Replace exact text in a remote file and write it atomically. " +
         "old_text must occur exactly once unless replace_all is true; otherwise the edit fails " +
-        "so an ambiguous change is never applied.",
+        "so an ambiguous change is never applied. Matching is exact, including line endings (CRLF files need \\r\\n in old_text). " +
+        "Returns SHA-256 before/after; expected_sha256 rejects the edit if the file changed after reading. " +
+        "POSIX mode is preserved; ownership may become the SSH user, and ACL/xattr are not guaranteed. Refuses symbolic links.",
       input: EDIT_INPUT,
       options: { namespace: "ssh", codemode: true },
       execute: async (raw, context) => {
@@ -874,20 +985,42 @@ export function createSshTools(
             ...(input.replace_all !== undefined
               ? { replaceAll: requireBoolean(input.replace_all, "replace_all") }
               : {}),
+            ...(input.expected_sha256 !== undefined
+              ? {
+                  expectedSha256: requireString(
+                    input.expected_sha256,
+                    "expected_sha256",
+                  ),
+                }
+              : {}),
           },
         );
 
-        return {
-          content: [
-            `Edited remote file: ${result.path}`,
-            `replacements: ${result.replacements}`,
+        const lines = [
+          `Edited remote file: ${result.path}`,
+          `replacements: ${result.replacements}`,
+          `sha256_before: ${result.sha256Before}`,
+          `sha256_after: ${result.sha256After}`,
+          `line_endings: ${result.lineEndings}`,
+          "",
+          ...result.preview.map((line) => `${line.number}: ${line.text}`),
+        ];
+        if (result.lineEndings === "crlf" || result.lineEndings === "mixed") {
+          lines.push(
             "",
-            ...result.preview.map((line) => `${line.number}: ${line.text}`),
-          ].join("\n"),
+            "[warning] File contains CRLF or mixed line endings; Linux scripts and cron entries usually require LF.",
+          );
+        }
+
+        return {
+          content: lines.join("\n"),
           metadata: {
             path: result.path,
             replacements: result.replacements,
             firstLine: result.firstLine,
+            sha256Before: result.sha256Before,
+            sha256After: result.sha256After,
+            lineEndings: result.lineEndings,
           },
         };
       },
@@ -897,28 +1030,39 @@ export function createSshTools(
       name: "glob",
       description:
         "Find remote files by glob pattern relative to a directory. " +
-        "Uses ripgrep when available, then find, then an SFTP walk. " +
+        "Chooses one engine: ripgrep when available, otherwise find, otherwise an SFTP walk. " +
+        "A legitimate zero result is returned as-is; it does not fall back to another scan. " +
+        "Errors and output truncation are reported instead of being hidden as empty results. " +
         "Default skips .git, node_modules, and hidden entries. " +
         "Prefer this over shelling out to find/glob through ssh_exec.",
       input: GLOB_INPUT,
       options: { namespace: "ssh", codemode: true },
-      execute: async (raw) => {
+      execute: async (raw, context) => {
         const input = asRecord(raw);
         const sshId = requireString(input.ssh_id, "ssh_id");
         const root =
           input.path === undefined
             ? await dependencies.manager.homeDir(sshId)
             : await resolveTargetPath(dependencies.manager, sshId, input.path);
-        const result = await dependencies.search.glob(sshId, {
-          pattern: requireString(input.pattern, "pattern"),
-          path: root,
-          ...(input.max_results !== undefined
-            ? { maxResults: requireInteger(input.max_results, "max_results") }
-            : {}),
-          ...(input.include_hidden !== undefined
-            ? { includeHidden: requireBoolean(input.include_hidden, "include_hidden") }
-            : {}),
-        });
+        const result = await dependencies.search.glob(
+          sshId,
+          {
+            pattern: requireString(input.pattern, "pattern"),
+            path: root,
+            ...(input.max_results !== undefined
+              ? { maxResults: requireInteger(input.max_results, "max_results") }
+              : {}),
+            ...(input.include_hidden !== undefined
+              ? {
+                  includeHidden: requireBoolean(
+                    input.include_hidden,
+                    "include_hidden",
+                  ),
+                }
+              : {}),
+          },
+          context.signal,
+        );
 
         const lines = [
           `engine: ${result.engine}`,
@@ -943,35 +1087,54 @@ export function createSshTools(
     {
       name: "grep",
       description:
-        "Search remote file contents. Runs on the remote host with ripgrep when available, " +
-        "otherwise grep; there is no line-by-line SFTP fallback because it is far slower. " +
+        "Search remote file contents. Chooses one engine: ripgrep when available, otherwise grep; " +
+        "there is no line-by-line SFTP fallback because it is far slower. " +
+        "A legitimate zero match is returned as-is; it does not fall back to another scan. " +
+        "Errors and output truncation are reported instead of being hidden as empty results. " +
         "If the remote lacks both tools, suggest installing ripgrep via ssh_exec and ask the user first. " +
-        "Skips binary files; returns path, line number, and matching text up to max_matches.",
+        "Skips hidden entries, .git, and node_modules by default (set include_hidden=true to opt in); returns path, line number, and matching text up to max_matches.",
       input: GREP_INPUT,
       options: { namespace: "ssh", codemode: true },
-      execute: async (raw) => {
+      execute: async (raw, context) => {
         const input = asRecord(raw);
         const sshId = requireString(input.ssh_id, "ssh_id");
         const target =
           input.path === undefined
             ? await dependencies.manager.homeDir(sshId)
             : await resolveTargetPath(dependencies.manager, sshId, input.path);
-        const result = await dependencies.search.grep(sshId, {
-          pattern: requireString(input.pattern, "pattern"),
-          path: target,
-          ...(input.include !== undefined
-            ? { include: requireString(input.include, "include") }
-            : {}),
-          ...(input.literal !== undefined
-            ? { literal: requireBoolean(input.literal, "literal") }
-            : {}),
-          ...(input.case_sensitive !== undefined
-            ? { caseSensitive: requireBoolean(input.case_sensitive, "case_sensitive") }
-            : {}),
-          ...(input.max_matches !== undefined
-            ? { maxMatches: requireInteger(input.max_matches, "max_matches") }
-            : {}),
-        });
+        const result = await dependencies.search.grep(
+          sshId,
+          {
+            pattern: requireString(input.pattern, "pattern"),
+            path: target,
+            ...(input.include !== undefined
+              ? { include: requireString(input.include, "include") }
+              : {}),
+            ...(input.literal !== undefined
+              ? { literal: requireBoolean(input.literal, "literal") }
+              : {}),
+            ...(input.case_sensitive !== undefined
+              ? {
+                  caseSensitive: requireBoolean(
+                    input.case_sensitive,
+                    "case_sensitive",
+                  ),
+                }
+              : {}),
+            ...(input.include_hidden !== undefined
+              ? {
+                  includeHidden: requireBoolean(
+                    input.include_hidden,
+                    "include_hidden",
+                  ),
+                }
+              : {}),
+            ...(input.max_matches !== undefined
+              ? { maxMatches: requireInteger(input.max_matches, "max_matches") }
+              : {}),
+          },
+          context.signal,
+        );
 
         const lines = [
           `engine: ${result.engine}`,
@@ -998,7 +1161,7 @@ export function createSshTools(
       description:
         "Delete a remote file or directory. Removing a directory requires recursive: true. " +
         "Use dry_run: true first to see exactly what would be deleted; this tool has its own " +
-        "path-scoped permission prompt instead of running rm through ssh_exec.",
+        "path-scoped permission prompt instead of running rm through ssh_exec. Removing a symbolic link deletes the link itself, not its target.",
       input: REMOVE_INPUT,
       options: { namespace: "ssh", codemode: true },
       execute: async (raw, context) => {
@@ -1049,7 +1212,8 @@ export function createSshTools(
         "Copy files between the local machine and the remote host over SFTP. " +
         "direction is upload or download; both file and directory paths are supported. " +
         "Existing destination files abort the transfer unless overwrite: true. " +
-        "Symbolic links are rejected rather than followed.",
+        "Symbolic links are rejected rather than followed. Single files use a temporary file and atomic replace; a cancelled directory transfer may leave already-completed items. " +
+        "Byte and file progress is reported through the UI while the transfer runs.",
       input: TRANSFER_INPUT,
       options: { namespace: "ssh", codemode: true },
       execute: async (raw, context) => {
@@ -1067,6 +1231,7 @@ export function createSshTools(
         await assertPathPermission(dependencies, context, sshId, target);
 
         const sftp = await dependencies.manager.sftp(sshId);
+        let lastProgressAt = 0;
         const result = await transferPath(sftp, {
           direction,
           localPath: requireString(input.local_path, "local_path"),
@@ -1074,6 +1239,20 @@ export function createSshTools(
           ...(input.overwrite !== undefined
             ? { overwrite: requireBoolean(input.overwrite, "overwrite") }
             : {}),
+          onProgress: (update) => {
+            const now = Date.now();
+            if (now - lastProgressAt < 1_000) return;
+            lastProgressAt = now;
+            void context
+              .progress({
+                type: "ssh.transfer.progress",
+                direction: update.direction,
+                files: update.files,
+                bytes: update.bytes,
+              })
+              .catch(() => undefined);
+          },
+          signal: context.signal,
         });
 
         return {
@@ -1097,6 +1276,7 @@ export function createSshTools(
         "Environment variables go inline in the command (export FOO=bar && ...). " +
         "Run a foreground command only: if the command backgrounds itself (nohup, &, docker run -d), do not use ssh_job_start; the job would finish immediately and track only the launcher. Use ssh_exec and manage that process yourself instead. " +
         "Only the host process is tracked; containers keep their own lifecycle, so decide separately whether to stop or leave them running. " +
+        "Cancelling this tool call or disconnecting does not stop the job; use ssh_job_stop for that. " +
         "Inspect with ssh_job_status, terminate with ssh_job_stop, clean up with ssh_remove on job_dir. POSIX remotes only.",
       input: JOB_START_INPUT,
       options: { namespace: "ssh", codemode: true },
@@ -1135,7 +1315,7 @@ export function createSshTools(
       name: "job_status",
       description:
         "Check a job started by ssh_job_start, or list all jobs when job_id is omitted. " +
-        "States: starting, running, finished (has exit_code), lost (process gone without exit_code), corrupt. " +
+        "States: starting, running, finished (has exit_code), stopped (terminated by ssh_job_stop), lost (process gone without exit_code), corrupt. " +
         "Pass log_lines to include the tail of output.log. " +
         "Finished jobs keep their logs until you remove their job_dir with ssh_remove.",
       input: JOB_STATUS_INPUT,
@@ -1176,7 +1356,7 @@ export function createSshTools(
         "Kills the whole process group when available. Refuses to signal a pid whose command line " +
         "does not belong to the job, which protects against pid reuse. " +
         "Only the host process is tracked; containers keep their own lifecycle and are not stopped. " +
-        "Finished jobs are reported without doing anything.",
+        "Finished jobs are reported without doing anything. This is the job termination tool; no separate job_kill is needed.",
       input: JOB_STOP_INPUT,
       options: { namespace: "ssh", codemode: true },
       execute: async (raw, context) => {
@@ -1221,7 +1401,9 @@ export function createSshTools(
       name: "profile_add",
       description:
         "Save a reusable SSH profile. Passwords and passphrases are encrypted at rest with AES-256-GCM. " +
-        "Returns a profile_id for ssh_connect.",
+        "Returns a profile_id for ssh_connect. " +
+        "This tool only writes storage: it does not connect, verify SSH credentials, or test sudo. " +
+        "An omitted sudo_password means no password will be sent later; it does not prove passwordless sudo.",
       input: PROFILE_ADD_INPUT,
       options: { namespace: "ssh", codemode: true },
       execute: async (raw) => {
@@ -1268,7 +1450,7 @@ export function createSshTools(
 
         return {
           content: formatProfile(profile, "SSH profile saved."),
-          metadata: { profileId: profile.id },
+          metadata: { profileId: profile.id, revision: profile.revision },
         };
       },
     },
@@ -1276,7 +1458,9 @@ export function createSshTools(
     {
       name: "profile_update",
       description:
-        "Update an existing SSH profile. Only the provided fields change. Use clear_* flags to remove stored secrets.",
+        "Update an existing SSH profile. Only the provided fields change. Use clear_* flags to remove stored secrets. " +
+        "This tool only updates storage; it does not connect or test the new credentials or sudo password. " +
+        "Connection-affecting changes increment the profile revision and mark existing profile connections stale; they are not disconnected.",
       input: PROFILE_UPDATE_INPUT,
       options: { namespace: "ssh", codemode: true },
       execute: async (raw) => {
@@ -1361,16 +1545,18 @@ export function createSshTools(
           },
         );
 
+        dependencies.manager.markProfileStale(profile.id, profile.revision);
         return {
           content: formatProfile(profile, "SSH profile updated."),
-          metadata: { profileId: profile.id },
+          metadata: { profileId: profile.id, revision: profile.revision },
         };
       },
     },
 
     {
       name: "profile_remove",
-      description: "Delete a saved SSH profile by profile_id.",
+      description:
+        "Delete a saved SSH profile by profile_id. Active connections are not disconnected; they are marked stale and keep running existing work.",
       input: PROFILE_REMOVE_INPUT,
       options: { namespace: "ssh", codemode: true },
       execute: async (raw) => {
@@ -1380,6 +1566,7 @@ export function createSshTools(
         if (!removed) {
           throw new Error(`SSH profile not found: ${profileId}`);
         }
+        dependencies.manager.markProfileStale(profileId);
         return {
           content: `SSH profile removed: ${profileId}`,
           metadata: { profileId },
@@ -1390,7 +1577,8 @@ export function createSshTools(
     {
       name: "profile_list",
       description:
-        "List saved SSH profiles. Passwords, passphrases, and sudo passwords are never included.",
+        "List saved SSH profiles, including each current revision. Passwords, passphrases, and sudo passwords are never included. " +
+        "sudo_password=yes only means a secret is stored, not that it is valid; sudo_password=no does not prove passwordless sudo.",
       input: PROFILE_LIST_INPUT,
       options: { namespace: "ssh", codemode: true },
       execute: async () => {
@@ -1414,6 +1602,7 @@ export function createSshTools(
           }
           if (profile.hasPrivateKeyPassphrase) bits.push("key_passphrase=yes");
           if (profile.hasSudoPassword) bits.push("sudo_password=yes");
+          bits.push(`revision=${profile.revision}`);
           bits.push(`host_key_policy=${profile.hostKeyPolicy}`);
           lines.push(bits.join("  "));
         }
@@ -1426,6 +1615,58 @@ export function createSshTools(
   ];
 }
 
+function toToolError(
+  error: unknown,
+  fallbackCode: "SSH_INVALID_INPUT" | "SSH_INTERNAL_ERROR" = "SSH_INTERNAL_ERROR",
+): never {
+  if (error instanceof SshOperationError) {
+    const metadata: Record<string, unknown> = {
+      errorCode: error.code,
+      retryable: error.retryable,
+      hint: error.hint,
+      executionMayHaveStarted: error.executionMayHaveStarted,
+    };
+    if (error.recommendedNextTool !== undefined) {
+      metadata.recommendedNextTool = error.recommendedNextTool;
+    }
+    // Code Mode surfaces the error message but not always the metadata, so
+    // repeat the recovery fields in text as well.
+    const message = [
+      error.message,
+      "",
+      `error_code: ${error.code}`,
+      `retryable: ${error.retryable ? "yes" : "no"}`,
+      `execution_may_have_started: ${error.executionMayHaveStarted ? "yes" : "no"}`,
+      `hint: ${error.hint}`,
+      ...(error.recommendedNextTool !== undefined
+        ? [`recommended_next_tool: ${error.recommendedNextTool}`]
+        : []),
+    ].join("\n");
+    throw new ToolError({ message, metadata });
+  }
+
+  const invalid = fallbackCode === "SSH_INVALID_INPUT";
+  const hint = invalid
+    ? "Fix the tool input and retry."
+    : "Unexpected SSH plugin error; re-check the connection and inputs.";
+  throw new ToolError({
+    message: [
+      errorMessage(error),
+      "",
+      `error_code: ${fallbackCode}`,
+      `retryable: ${invalid ? "no" : "yes"}`,
+      "execution_may_have_started: no",
+      `hint: ${hint}`,
+    ].join("\n"),
+    metadata: {
+      errorCode: fallbackCode,
+      retryable: !invalid,
+      hint,
+      executionMayHaveStarted: false,
+    },
+  });
+}
+
 function formatConnection(info: ConnectionInfo, title: string): string {
   const lines = [
     title,
@@ -1435,6 +1676,10 @@ function formatConnection(info: ConnectionInfo, title: string): string {
     `auth: ${info.authMethod}`,
   ];
   if (info.profileId) lines.push(`profile_id: ${info.profileId}`);
+  if (info.profileRevision !== undefined) {
+    lines.push(`profile_revision: ${info.profileRevision}`);
+  }
+  if (info.stale) lines.push("stale: yes");
   if (info.hostKeyFingerprint) {
     lines.push(`host_key: ${info.hostKeyFingerprint}`);
   }
@@ -1450,6 +1695,10 @@ function connectionMetadata(info: ConnectionInfo): Record<string, unknown> {
     authMethod: info.authMethod,
     reused: info.reused === true,
     ...(info.profileId ? { profileId: info.profileId } : {}),
+    ...(info.profileRevision !== undefined
+      ? { profileRevision: info.profileRevision }
+      : {}),
+    ...(info.stale ? { stale: true } : {}),
     ...(info.hostKeyFingerprint
       ? { hostKeyFingerprint: info.hostKeyFingerprint }
       : {}),
@@ -1467,6 +1716,7 @@ function formatProfile(
     privateKeyPath?: string;
     hasSudoPassword: boolean;
     hostKeyPolicy: string;
+    revision: number;
   },
   title: string,
 ): string {
@@ -1479,6 +1729,7 @@ function formatProfile(
   ];
   if (profile.privateKeyPath) lines.push(`key: ${profile.privateKeyPath}`);
   lines.push(`sudo_password: ${profile.hasSudoPassword ? "yes" : "no"}`);
+  lines.push(`revision: ${profile.revision}`);
   lines.push(`host_key_policy: ${profile.hostKeyPolicy}`);
   return lines.join("\n");
 }
@@ -1573,11 +1824,18 @@ function formatReadResult(result: ReadRemoteFileResult): string {
   const lines = [
     `path: ${result.path}`,
     `size: ${result.size}`,
+    `bytes: ${result.byteStart}-${result.byteEnd} (end exclusive)`,
+    result.sha256 === null
+      ? "sha256: unavailable (partial file window)"
+      : `sha256: ${result.sha256}`,
+    `line_endings: ${result.lineEndings}`,
     `binary: ${result.binary ? "yes" : "no"}`,
     `truncated: ${result.truncated ? "yes" : "no"}`,
-    result.totalLines === null
-      ? "lines: unknown"
-      : `lines: ${result.startLine}-${result.endLine} of ${result.totalLines}`,
+    result.lineNumbers
+      ? result.totalLines === null
+        ? `lines: ${result.startLine}-${result.endLine} of unknown`
+        : `lines: ${result.startLine}-${result.endLine} of ${result.totalLines}`
+      : "line numbers: unavailable (byte-offset window)",
     "",
   ];
   if (result.binary) {
@@ -1591,22 +1849,46 @@ function formatReadResult(result: ReadRemoteFileResult): string {
     return lines.join("\n");
   }
   for (const line of result.lines) {
-    lines.push(`${line.number}: ${line.text}`);
+    lines.push(
+      result.lineNumbers ? `${line.number}: ${line.text}` : line.text,
+    );
   }
   if (result.truncated) {
-    lines.push(
-      "",
-      "[note] Output was truncated. Read again with offset/limit or raise max_bytes.",
-    );
+    const notes: string[] = [];
+    if (result.byteEnd < result.size) {
+      notes.push(
+        `Read more with byte_offset=${result.byteEnd} or raise max_bytes.`,
+      );
+    }
+    if (
+      result.lineNumbers &&
+      result.totalLines !== null &&
+      result.endLine < result.totalLines
+    ) {
+      notes.push("Read more with offset/limit.");
+    }
+    if (notes.length === 0) {
+      notes.push("Raise max_bytes or limit to read more.");
+    }
+    lines.push("", `[note] ${notes.join(" ")}`);
   }
   return lines.join("\n");
 }
 
 function formatExec(result: ExecResult): string {
+  const stdoutBytes =
+    result.stdoutBytes ?? Buffer.byteLength(result.stdout, "utf8");
+  const stderrBytes =
+    result.stderrBytes ?? Buffer.byteLength(result.stderr, "utf8");
+  const stdoutRetained = Buffer.byteLength(result.stdout, "utf8");
+  const stderrRetained = Buffer.byteLength(result.stderr, "utf8");
+  const stdoutTruncated = result.stdoutTruncated ?? result.truncated;
+  const stderrTruncated = result.stderrTruncated ?? result.truncated;
   const lines: Array<string | undefined> = [
     `exit_code: ${result.exitCode === null ? "unknown" : result.exitCode}`,
     `duration_ms: ${result.durationMs}`,
-    `truncated: ${result.truncated ? "yes" : "no"}`,
+    `stdout: ${stdoutBytes} bytes, retained ${stdoutRetained}, truncated: ${stdoutTruncated ? "yes" : "no"}`,
+    `stderr: ${stderrBytes} bytes, retained ${stderrRetained}, truncated: ${stderrTruncated ? "yes" : "no"}`,
     result.signal ? `signal: ${result.signal}` : undefined,
     "",
     "[stdout]",
@@ -1615,10 +1897,10 @@ function formatExec(result: ExecResult): string {
     "[stderr]",
     result.stderr.length > 0 ? trimTrailingNewlines(result.stderr) : "(empty)",
   ];
-  if (result.truncated) {
+  if (stdoutTruncated || stderrTruncated) {
     lines.push(
       "",
-      "[note] Output exceeded the capture limit and was truncated. Use max_output_bytes to raise the limit.",
+      "[note] Output exceeded the capture limit. The beginning and end are shown; the middle was omitted. Raise max_output_bytes if needed.",
     );
   }
   return lines.filter(isDefined).join("\n");

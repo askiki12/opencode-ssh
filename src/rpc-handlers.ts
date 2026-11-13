@@ -45,11 +45,14 @@ export function createRpcHandlers(dependencies: RpcHandlerDependencies) {
 
     connectionsTest: (raw: unknown) =>
       safe(async () => {
-        const info = await manager.connect(raw as ConnectInput);
+        const info = await manager.connect({
+          ...(raw as ConnectInput),
+          forceNew: true,
+        });
         try {
           return info;
         } finally {
-          await manager.disconnect(info.id).catch(() => undefined);
+          await disconnectTestConnection(manager, info);
         }
       }),
 
@@ -61,15 +64,17 @@ export function createRpcHandlers(dependencies: RpcHandlerDependencies) {
     profilesUpdate: (raw: unknown) =>
       safe(async () => {
         const { profileId, patch } = splitProfileUpdate(raw);
-        return profiles.update(profileId, patch);
+        const profile = await profiles.update(profileId, patch);
+        manager.markProfileStale(profileId, profile.revision);
+        return profile;
       }),
 
     profilesRemove: (raw: unknown) =>
       safe(async () => {
         const input = asRecord(raw);
-        const removed = await profiles.remove(
-          requireString(input.profileId, "profileId"),
-        );
+        const profileId = requireString(input.profileId, "profileId");
+        const removed = await profiles.remove(profileId);
+        if (removed) manager.markProfileStale(profileId);
         return { removed };
       }),
 
@@ -77,8 +82,11 @@ export function createRpcHandlers(dependencies: RpcHandlerDependencies) {
       safe(async () => {
         const input = raw as ProfileInput;
         const info = await manager.connect(profileToConnectInput(input));
-        await manager.disconnect(info.id).catch(() => undefined);
-        return profiles.add(input);
+        try {
+          return profiles.add(input);
+        } finally {
+          await disconnectTestConnection(manager, info);
+        }
       }),
 
     profilesTestAndUpdate: (raw: unknown) =>
@@ -91,8 +99,13 @@ export function createRpcHandlers(dependencies: RpcHandlerDependencies) {
         const info = await manager.connect(
           mergeProfileForTest(existing, patch),
         );
-        await manager.disconnect(info.id).catch(() => undefined);
-        return profiles.update(profileId, patch);
+        try {
+          const profile = await profiles.update(profileId, patch);
+          manager.markProfileStale(profileId, profile.revision);
+          return profile;
+        } finally {
+          await disconnectTestConnection(manager, info);
+        }
       }),
 
     keysList: () => safe(async () => listPrivateKeys()),
@@ -118,12 +131,24 @@ function safe<T>(
   }
 }
 
+async function disconnectTestConnection(
+  manager: ConnectionManager,
+  info: ConnectionInfo,
+): Promise<void> {
+  // Defensive: never tear down a shared connection, even if a future change
+  // makes a test path reuse one.
+  if (info.reused === true) return;
+  await manager.disconnect(info.id).catch(() => undefined);
+}
+
 function profileToConnectInput(input: ProfileInput): ConnectInput {
   const target: ConnectInput = {
     user: input.user,
     host: input.host,
     port: input.port ?? 22,
     hostKeyPolicy: input.hostKeyPolicy ?? "accept-new",
+    // A test must exercise the supplied credentials, not an existing session.
+    forceNew: true,
   };
   if (input.password !== undefined) target.password = input.password;
   if (input.privateKeyPath !== undefined) {
@@ -181,6 +206,8 @@ function mergeProfileForTest(
     host: patch.host ?? existing.host,
     port: patch.port ?? existing.port,
     hostKeyPolicy: patch.hostKeyPolicy ?? existing.hostKeyPolicy,
+    // A test must exercise the patched credentials, not an existing session.
+    forceNew: true,
   };
   if (password !== undefined) target.password = password;
   if (privateKeyPath !== undefined) target.privateKeyPath = privateKeyPath;

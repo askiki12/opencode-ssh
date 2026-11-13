@@ -307,7 +307,11 @@ async function runConnect(
     rpc.profilesList({}),
     rpc.connectionsList({}),
   ]);
-  const active = new Set(connections.map(connectionTarget));
+  const active = new Set(
+    connections
+      .filter((connection) => connection.stale !== true)
+      .map(connectionTarget),
+  );
 
   if (argument.length > 0) {
     const profile = findProfile(profiles, argument);
@@ -347,7 +351,9 @@ async function runConnect(
     const input = await promptNewConnection(context, rpc);
     if (!input) return;
     const existing = connections.find(
-      (candidate) => connectionTarget(candidate) === inputTarget(input),
+      (candidate) =>
+        candidate.stale !== true &&
+        connectionTarget(candidate) === inputTarget(input),
     );
     if (existing) {
       const reuse = await context.ui.dialog.confirm({
@@ -639,7 +645,11 @@ async function runProfileRemove(
     });
     return;
   }
-  const active = new Set(connections.map(connectionTarget));
+  const active = new Set(
+    connections
+      .filter((connection) => connection.stale !== true)
+      .map(connectionTarget),
+  );
   const choice = await context.ui.dialog.select({
     title: "删除 SSH Profile",
     options: profiles.map((profile) => ({
@@ -689,7 +699,11 @@ async function runProfileList(
     });
     return;
   }
-  const active = new Set(connections.map(connectionTarget));
+  const active = new Set(
+    connections
+      .filter((connection) => connection.stale !== true)
+      .map(connectionTarget),
+  );
   await context.ui.dialog.alert({
     title: `SSH Profile (${profiles.length})`,
     message: profiles
@@ -715,7 +729,11 @@ async function runProfileEdit(
     });
     return;
   }
-  const active = new Set(connections.map(connectionTarget));
+  const active = new Set(
+    connections
+      .filter((connection) => connection.stale !== true)
+      .map(connectionTarget),
+  );
   const choice = await context.ui.dialog.select({
     title: "编辑 SSH Profile",
     options: profiles.map((profile) => ({
@@ -1080,7 +1098,8 @@ function inputTarget(input: ConnectFormInput): string {
 }
 
 function formatConnection(connection: ConnectionInfo): string {
-  return `${connection.name}  ${connection.user}@${connection.host}:${connection.port}  idle=${formatDuration(connection.idleMs)}`;
+  const stale = connection.stale === true ? "  [stale]" : "";
+  return `${connection.name}  ${connection.user}@${connection.host}:${connection.port}  idle=${formatDuration(connection.idleMs)}${stale}`;
 }
 
 function formatProfile(profile: PublicProfile, active: boolean): string {

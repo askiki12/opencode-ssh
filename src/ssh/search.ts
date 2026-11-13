@@ -20,6 +20,7 @@ export interface GrepOptions {
   include?: string;
   literal?: boolean;
   caseSensitive?: boolean;
+  includeHidden?: boolean;
   maxMatches?: number;
 }
 
@@ -58,18 +59,21 @@ export class SearchService {
 
   constructor(private readonly manager: ConnectionManager) {}
 
-  async tools(sshId: string): Promise<RemoteTools> {
+  async tools(sshId: string, signal?: AbortSignal): Promise<RemoteTools> {
     const cached = this.probes.get(sshId);
     if (cached) return cached;
 
     const probe = this.manager
-      .exec({
-        sshId,
-        command:
-          "for tool in rg grep find; do if command -v \"$tool\" >/dev/null 2>&1; then echo \"$tool=1\"; else echo \"$tool=0\"; fi; done",
-        timeoutMs: 15_000,
-        maxOutputBytes: 4_096,
-      })
+      .exec(
+        {
+          sshId,
+          command:
+            "for tool in rg grep find; do if command -v \"$tool\" >/dev/null 2>&1; then echo \"$tool=1\"; else echo \"$tool=0\"; fi; done",
+          timeoutMs: 15_000,
+          maxOutputBytes: 4_096,
+        },
+        signal,
+      )
       .then((result) => parseProbe(result.stdout));
 
     this.probes.set(sshId, probe);
@@ -77,14 +81,18 @@ export class SearchService {
     return probe;
   }
 
-  async grep(sshId: string, options: GrepOptions): Promise<GrepResult> {
-    const tools = await this.tools(sshId);
+  async grep(
+    sshId: string,
+    options: GrepOptions,
+    signal?: AbortSignal,
+  ): Promise<GrepResult> {
+    const tools = await this.tools(sshId, signal);
     const maxMatches = clamp(options.maxMatches ?? 200, 1, 5_000);
     if (tools.rg) {
-      return this.grepWithRipgrep(sshId, options, maxMatches);
+      return this.grepWithRipgrep(sshId, options, maxMatches, signal);
     }
     if (tools.grep) {
-      return this.grepWithGrep(sshId, options, maxMatches);
+      return this.grepWithGrep(sshId, options, maxMatches, signal);
     }
     throw new Error(
       "Remote host has neither ripgrep (rg) nor grep. Install ripgrep with the " +
@@ -93,49 +101,65 @@ export class SearchService {
     );
   }
 
-  async glob(sshId: string, options: GlobOptions): Promise<GlobResult> {
-    const tools = await this.tools(sshId);
+  async glob(
+    sshId: string,
+    options: GlobOptions,
+    signal?: AbortSignal,
+  ): Promise<GlobResult> {
+    const tools = await this.tools(sshId, signal);
     const maxResults = clamp(options.maxResults ?? 2_000, 1, 5_000);
+    // Pick one engine and accept an empty result as success. Falling through
+    // on zero matches would scan the tree up to three times.
     if (tools.rg) {
-      const result = await this.rgFiles(sshId, options, maxResults);
-      if (result.paths.length > 0) return result;
+      return this.rgFiles(sshId, options, maxResults, signal);
     }
     if (tools.find) {
-      const result = await this.findFiles(sshId, options, maxResults);
-      if (result.paths.length > 0) return result;
+      return this.findFiles(sshId, options, maxResults, signal);
     }
-    return this.sftpFiles(sshId, options, maxResults);
+    return this.sftpFiles(sshId, options, maxResults, signal);
   }
 
   private async grepWithRipgrep(
     sshId: string,
     options: GrepOptions,
     maxMatches: number,
+    signal?: AbortSignal,
   ): Promise<GrepResult> {
     const flags = [
       "--no-config",
       "--json",
-      "--hidden",
       "--no-messages",
       "--max-filesize",
       "10M",
+      "--glob",
+      shellQuote("!**/.git/**"),
+      "--glob",
+      shellQuote("!**/node_modules/**"),
     ];
+    if (options.includeHidden === true) flags.push("--hidden");
     if (options.literal === true) flags.push("-F");
     if (options.caseSensitive === false) flags.push("-i");
     if (options.include !== undefined) {
       flags.push("--glob", shellQuote(options.include));
     }
 
-    const result = await this.run(sshId, [
-      "rg",
-      ...flags,
-      "-e",
-      shellQuote(options.pattern),
-      "--",
-      shellQuote(options.path),
-    ]);
+    const result = await this.run(
+      sshId,
+      [
+        "rg",
+        ...flags,
+        "-e",
+        shellQuote(options.pattern),
+        "--",
+        shellQuote(options.path),
+      ],
+      signal,
+    );
 
-    if (result.exitCode === 2) {
+    if (result.exitCode === 1) {
+      return { engine: "rg", matches: [], truncated: result.truncated };
+    }
+    if (result.exitCode !== 0) {
       throw new Error(commandFailure("rg", result));
     }
 
@@ -160,13 +184,18 @@ export class SearchService {
       });
     }
 
-    return { engine: "rg", matches, truncated };
+    return {
+      engine: "rg",
+      matches,
+      truncated: truncated || result.truncated,
+    };
   }
 
   private async grepWithGrep(
     sshId: string,
     options: GrepOptions,
     maxMatches: number,
+    signal?: AbortSignal,
   ): Promise<GrepResult> {
     const flags = [
       "-rIn",
@@ -174,22 +203,32 @@ export class SearchService {
       "--exclude-dir=.git",
       "--exclude-dir=node_modules",
     ];
+    if (options.includeHidden !== true) {
+      flags.push("--exclude-dir=.*", "--exclude=.*");
+    }
     if (options.literal === true) flags.push("-F");
     if (options.caseSensitive === false) flags.push("-i");
     if (options.include !== undefined) {
       flags.push("--include", shellQuote(options.include));
     }
 
-    const result = await this.run(sshId, [
-      "grep",
-      ...flags,
-      "-e",
-      shellQuote(options.pattern),
-      "--",
-      shellQuote(options.path),
-    ]);
+    const result = await this.run(
+      sshId,
+      [
+        "grep",
+        ...flags,
+        "-e",
+        shellQuote(options.pattern),
+        "--",
+        shellQuote(options.path),
+      ],
+      signal,
+    );
 
-    if (result.exitCode === 2) {
+    if (result.exitCode === 1) {
+      return { engine: "grep", matches: [], truncated: result.truncated };
+    }
+    if (result.exitCode !== 0) {
       throw new Error(commandFailure("grep", result));
     }
 
@@ -210,16 +249,18 @@ export class SearchService {
       });
     }
 
-    if (result.exitCode === 1 && matches.length === 0) {
-      return { engine: "grep", matches, truncated: false };
-    }
-    return { engine: "grep", matches, truncated };
+    return {
+      engine: "grep",
+      matches,
+      truncated: truncated || result.truncated,
+    };
   }
 
   private async rgFiles(
     sshId: string,
     options: GlobOptions,
     maxResults: number,
+    signal?: AbortSignal,
   ): Promise<GlobResult> {
     const flags = ["--files", "--glob", shellQuote(options.pattern)];
     if (options.includeHidden === true) flags.push("--hidden");
@@ -227,15 +268,20 @@ export class SearchService {
     flags.push("--glob", shellQuote("!**/node_modules/**"));
     flags.push("-0");
 
-    const result = await this.manager.exec({
-      sshId,
-      command: `rg ${flags.join(" ")}`,
-      cwd: options.path,
-      timeoutMs: SEARCH_TIMEOUT_MS,
-      maxOutputBytes: SEARCH_MAX_BYTES,
-    });
-    if (result.exitCode !== 0) {
-      return { engine: "rg", paths: [], truncated: false };
+    const result = await this.manager.exec(
+      {
+        sshId,
+        command: `rg ${flags.join(" ")}`,
+        cwd: options.path,
+        timeoutMs: SEARCH_TIMEOUT_MS,
+        maxOutputBytes: SEARCH_MAX_BYTES,
+      },
+      signal,
+    );
+    // `rg --files` uses 0 for success. Some builds return 1 for no files;
+    // anything higher is a real error (bad path, permissions, invalid flags).
+    if (result.exitCode !== 0 && result.exitCode !== 1) {
+      throw new Error(commandFailure("rg", result));
     }
 
     const paths = splitNul(result.stdout)
@@ -245,7 +291,7 @@ export class SearchService {
     return {
       engine: "rg",
       paths: paths.slice(0, maxResults),
-      truncated: paths.length > maxResults,
+      truncated: result.truncated || paths.length > maxResults,
     };
   }
 
@@ -253,16 +299,39 @@ export class SearchService {
     sshId: string,
     options: GlobOptions,
     maxResults: number,
+    signal?: AbortSignal,
   ): Promise<GlobResult> {
-    const result = await this.run(sshId, [
-      "find",
-      shellQuote(options.path),
-      "-type",
-      "f",
-      "-print0",
-    ]);
+    // Prune ignored directories during the walk instead of downloading their
+    // entire contents and filtering afterwards.
+    const names =
+      options.includeHidden === true
+        ? [".git", "node_modules"]
+        : [".git", "node_modules", ".*"];
+    const nameTests: string[] = [];
+    for (const [index, name] of names.entries()) {
+      if (index > 0) nameTests.push("-o");
+      nameTests.push("-name", shellQuote(name));
+    }
+    const result = await this.run(
+      sshId,
+      [
+        "find",
+        shellQuote(options.path),
+        "-mindepth",
+        "1",
+        "\\(",
+        ...nameTests,
+        "\\)",
+        "-prune",
+        "-o",
+        "-type",
+        "f",
+        "-print0",
+      ],
+      signal,
+    );
     if (result.exitCode !== 0) {
-      return { engine: "find", paths: [], truncated: false };
+      throw new Error(commandFailure("find", result));
     }
 
     const matcher = globToRegExp(options.pattern);
@@ -279,7 +348,7 @@ export class SearchService {
     return {
       engine: "find",
       paths: paths.slice(0, maxResults),
-      truncated: paths.length > maxResults,
+      truncated: result.truncated || paths.length > maxResults,
     };
   }
 
@@ -287,6 +356,7 @@ export class SearchService {
     sshId: string,
     options: GlobOptions,
     maxResults: number,
+    signal?: AbortSignal,
   ): Promise<GlobResult> {
     const sftp = await this.manager.sftp(sshId);
     const matcher = globToRegExp(options.pattern);
@@ -294,8 +364,10 @@ export class SearchService {
     let truncated = false;
 
     const visit = async (directory: string): Promise<void> => {
+      if (signal?.aborted) throw new Error("Search aborted.");
       const entries = await callSftp(sftp, directory);
       for (const entry of entries) {
+        if (signal?.aborted) throw new Error("Search aborted.");
         if (paths.length >= maxResults) {
           truncated = true;
           return;
@@ -323,13 +395,20 @@ export class SearchService {
     };
   }
 
-  private run(sshId: string, argv: string[]): Promise<ExecResult> {
-    return this.manager.exec({
-      sshId,
-      command: argv.join(" "),
-      timeoutMs: SEARCH_TIMEOUT_MS,
-      maxOutputBytes: SEARCH_MAX_BYTES,
-    });
+  private run(
+    sshId: string,
+    argv: string[],
+    signal?: AbortSignal,
+  ): Promise<ExecResult> {
+    return this.manager.exec(
+      {
+        sshId,
+        command: argv.join(" "),
+        timeoutMs: SEARCH_TIMEOUT_MS,
+        maxOutputBytes: SEARCH_MAX_BYTES,
+      },
+      signal,
+    );
   }
 }
 
