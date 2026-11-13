@@ -37,6 +37,12 @@
   - 最小版本：`profile_ids[] + parallel + stop_on_error`，不做 tag/rolling。
   - 只有机器数量上来（>5）或需要统一审计时才值得做；当前用现有工具循环即可。
 
+- [ ] **profile tags 与批量文件传输**
+  - 现状：`ssh_exec` / `ssh_transfer` 都是单机工具，必须逐个指定 `profile_id`；12 台以内可以用命名约定 + 循环解决。
+  - tags 本身只是选择器，单独增加不会减少工具调用；需要和 `fleet_exec` / `fleet_transfer` 配套才有价值。
+  - 最小路径：先做 `fleet_exec` 的 `profile_ids[]`，再做 tags；文件批量传输需要独立的 `fleet_transfer`。
+  - 批量操作还需定义每台权限、部分失败、重试和清理语义；只有分组操作频繁或机器数量明显增加时才值得做。
+
 - [ ] **`ssh_patch`（统一 diff 应用）**
   - 需要远端有 `patch` 或 `git apply`；建议先 `--dry-run` 再执行。
   - 先观察 `ssh_edit` 是否够用，再决定是否值得新增工具。
