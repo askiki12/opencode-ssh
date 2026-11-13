@@ -584,6 +584,7 @@ export function createSshTools(
         "Call ssh_list first if you need to inspect active connections. " +
         "Pass force_new=true only when the user explicitly wants a separate connection. " +
         "Provide either profile_id or inline user/host plus exactly one of password or private_key_path. " +
+        "Connection failures include the target and a hint for host-not-found/DNS, refused, timeout, or authentication failures. " +
         "A successful connect verifies SSH authentication only; it does not test sudo. " +
         "A missing sudo_password does not prove passwordless sudo, and a wrong password is not detected until sudo runs. " +
         "Reuse also requires the same profile revision; after a connection-affecting profile change, a new connection is created and the old one is marked stale instead of being interrupted.",
@@ -739,8 +740,10 @@ export function createSshTools(
       description:
         "Execute a command over a persistent SSH connection. Returns the exit code, stdout, and stderr. " +
         "Use an ssh_id from ssh_connect or ssh_list; prefer reusing an existing connection instead of connecting again. " +
+        "For long-running foreground work, prefer ssh_job_start so the job and log survive disconnect; use ssh_exec for short commands or work you explicitly detach and manage yourself. " +
         "Each call opens a new channel, so shell state such as cd/export does not persist; use cwd and env instead. " +
         "tty=true allocates a PTY but does not provide interactive stdin; stdin closes immediately, so use it for TTY detection/color, not for prompts. " +
+        "Background processes inherit the SSH channel's stdout/stderr; if they outlive this call they can hit EPIPE/SIGPIPE or SIGHUP. Redirect stdin/stdout/stderr and detach, or use ssh_job_start. " +
         "Set sudo=true to run through sudo, or as_user to switch users. " +
         "sudo uses the sudo password stored on the connection; the password is written to sudo's stdin, never to the command line. " +
         "The tool does not pre-check sudo: a missing password may still work (NOPASSWD) or fail, and a wrong password is only visible in exit_code/stderr. " +
@@ -1274,7 +1277,7 @@ export function createSshTools(
         "Use this for tasks that outlive one tool call (training, builds, migrations) instead of raising ssh_exec timeout_ms. " +
         "The process survives disconnect and OpenCode restarts. " +
         "Environment variables go inline in the command (export FOO=bar && ...). " +
-        "Run a foreground command only: if the command backgrounds itself (nohup, &, docker run -d), do not use ssh_job_start; the job would finish immediately and track only the launcher. Use ssh_exec and manage that process yourself instead. " +
+        "Run a foreground command. Scripts that start parallel children and wait for them (for example `&` + `wait`) are still foreground and are good candidates. Avoid ssh_job_start only when the command returns immediately and leaves detached work behind (for example `nohup cmd &` then exit): the job would finish immediately and track only the launcher. In that case use ssh_exec with stdin/stdout/stderr redirected and detached. " +
         "Only the host process is tracked; containers keep their own lifecycle, so decide separately whether to stop or leave them running. " +
         "Cancelling this tool call or disconnecting does not stop the job; use ssh_job_stop for that. " +
         "Inspect with ssh_job_status, terminate with ssh_job_stop, clean up with ssh_remove on job_dir. POSIX remotes only.",

@@ -82,7 +82,7 @@ Rules that matter:
 Use the job tools when a task should outlive one tool call (training, builds, migrations, long test suites):
 
 - `ssh_job_start` returns `job_id`, `pid`, `job_dir`, and the log path. It returns immediately; it does not wait for the command.
-- The job wraps a **foreground** command. If the command backgrounds itself (`nohup`, `&`, `docker run -d`), the job finishes immediately and tracks only the launcher — use `ssh_exec` and manage that process yourself instead.
+- The job wraps a **foreground** command, including scripts that start parallel children and wait for them (`&` + `wait`). Only commands that return immediately and leave detached work behind (`nohup cmd &`, `docker run -d`) finish the job early and track only the launcher; use `ssh_exec` with stdin/stdout/stderr redirected and detached for those.
 - Do **not** raise `ssh_exec`'s `timeout_ms` to hours. That holds a channel open and loses the result on disconnect.
 - `ssh_job_status` with `job_id` shows state, exit code, elapsed time; add `log_lines` to tail output. Call it without `job_id` to list all jobs.
 - States: `starting`, `running`, `finished`, `stopped`, `lost` (process gone, no exit code), `corrupt`.

@@ -36,7 +36,11 @@ import {
   type JobInfo,
 } from "../src/ssh/jobs.js";
 import { SshOperationError } from "../src/ssh/errors.js";
-import { ConnectionManager, type ExecResult } from "../src/ssh/manager.js";
+import {
+  ConnectionManager,
+  describeConnectError,
+  type ExecResult,
+} from "../src/ssh/manager.js";
 import { globToRegExp, SearchService } from "../src/ssh/search.js";
 import { createSshTools, type ToolDefinition } from "../src/tools/definitions.js";
 import { OutputCollector } from "../src/util.js";
@@ -746,6 +750,46 @@ async function main() {
   } finally {
     rmSync(jobRoot, { recursive: true, force: true });
   }
+
+  const connectTarget = { user: "tester", host: "as", port: 22 };
+  const dnsError = Object.assign(
+    new Error("getaddrinfo ENOTFOUND as"),
+    { code: "ENOTFOUND" },
+  );
+  assert.match(
+    describeConnectError(dnsError, connectTarget).message,
+    /tester@as:22: host not found/,
+  );
+  assert.match(
+    describeConnectError(
+      Object.assign(new Error("connect ECONNREFUSED"), {
+        code: "ECONNREFUSED",
+      }),
+      connectTarget,
+    ).message,
+    /connection refused/,
+  );
+  assert.match(
+    describeConnectError(
+      Object.assign(new Error("Timed out while waiting for handshake"), {
+        code: "ETIMEDOUT",
+      }),
+      connectTarget,
+    ).message,
+    /timed out/,
+  );
+  assert.match(
+    describeConnectError(
+      new Error("All configured authentication methods failed"),
+      connectTarget,
+    ).message,
+    /authentication failed/,
+  );
+  assert.match(
+    describeConnectError(new Error("unexpected socket failure"), connectTarget)
+      .message,
+    /Unable to connect to tester@as:22: unexpected socket failure/,
+  );
 
   const config = resolveConfig(
     { dataDir, connectTimeoutMs: 3000, execTimeoutMs: 5000 },

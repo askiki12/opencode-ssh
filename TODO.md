@@ -122,3 +122,4 @@
 - 2026-11-13：统一取消信号：`ssh_exec` abort 时发送远端 `KILL`；`ssh_glob` / `ssh_grep` 传递 AbortSignal；`ssh_transfer` 支持 signal、单文件临时文件 + 原子替换并在失败/取消时尽力清理。job 生命周期保持独立，不新增 `job_kill`。
 - 2026-11-13：`ssh_grep` 默认跳过隐藏项、`.git`、`node_modules`，新增 `include_hidden`；`ssh_write` / `ssh_edit` 拒绝 symlink，说明 mode/ownership/ACL/xattr 限制；`ssh_edit` 增加前后 SHA-256、`expected_sha256` 和 CRLF 精确匹配提示；`ssh_write` / `ssh_edit`、`ssh_read` 报告 line endings，CRLF 时警告。
 - 2026-11-13：文档与工具描述对齐：补齐 files/search/jobs/errors 分层、移除“不支持 SFTP”的过期限制、补齐 profile revision/stale、job 状态与 no job_kill、tty/pager/取消/读文件 hash/line endings 等风险提示；TUI 手动连接不再复用 stale 连接。
+- 2026-11-13：连接错误归一化：`ENOTFOUND` / `ECONNREFUSED` / `ETIMEDOUT` / unreachable / reset / 认证失败带 `user@host:port` 和恢复提示；host key mismatch 和私钥读取错误保持专用提示。

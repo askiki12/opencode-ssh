@@ -219,7 +219,9 @@ export class ConnectionManager {
     let connection: ActiveConnection | undefined;
 
     client.on("error", (error: Error) => {
-      if (connection) connection.lastError = errorMessage(error);
+      if (connection) {
+        connection.lastError = describeConnectError(error, target).message;
+      }
     });
     client.on("close", () => {
       this.connections.delete(id);
@@ -281,12 +283,18 @@ export class ConnectionManager {
         client.off("error", onError);
         client.off("close", onClose);
       };
-      const fail = (error: Error) => {
+      const fail = (error: Error, wrap = true) => {
         if (settled) return;
         settled = true;
         cleanup();
         client.destroy();
-        reject(hostKeyError ? new Error(hostKeyError) : error);
+        reject(
+          hostKeyError
+            ? new Error(hostKeyError)
+            : wrap
+              ? describeConnectError(error, target)
+              : error,
+        );
       };
       const onReady = () => {
         if (settled) return;
@@ -305,6 +313,7 @@ export class ConnectionManager {
             `SSH connection to ${target.user}@${target.host}:${target.port} ` +
               "closed before authentication completed.",
           ),
+          false,
         );
 
       client.once("ready", onReady);
@@ -957,6 +966,66 @@ export class ConnectionManager {
     }
     return target;
   }
+}
+
+export function describeConnectError(
+  error: Error,
+  target: { user: string; host: string; port: number },
+): Error {
+  if (error instanceof SshOperationError) return error;
+
+  const message = errorMessage(error);
+  const code = (error as { code?: unknown }).code;
+  const base = `Unable to connect to ${target.user}@${target.host}:${target.port}`;
+  const detail = `\n${message}`;
+
+  if (
+    code === "ENOTFOUND" ||
+    code === "EAI_NONAME" ||
+    code === "EAI_AGAIN" ||
+    /getaddrinfo .*ENOTFOUND|EAI_NONAME|EAI_AGAIN/i.test(message)
+  ) {
+    return new Error(
+      `${base}: host not found. Check the hostname, DNS, or VPN.${detail}`,
+    );
+  }
+  if (code === "ECONNREFUSED" || /ECONNREFUSED/i.test(message)) {
+    return new Error(
+      `${base}: connection refused. Check the port and whether SSH is running.${detail}`,
+    );
+  }
+  if (code === "ETIMEDOUT" || /timed out|timeout/i.test(message)) {
+    return new Error(
+      `${base}: connection timed out. Check network, firewall, and host reachability.${detail}`,
+    );
+  }
+  if (
+    code === "EHOSTUNREACH" ||
+    code === "ENETUNREACH" ||
+    /unreachable|no route to host/i.test(message)
+  ) {
+    return new Error(
+      `${base}: host or network unreachable. Check routing, VPN, or firewall rules.${detail}`,
+    );
+  }
+  if (code === "ECONNRESET" || /connection reset/i.test(message)) {
+    return new Error(
+      `${base}: connection was reset before authentication completed.${detail}`,
+    );
+  }
+  if (
+    /authentication methods failed|authentication failure|permission denied \(publickey|no supported authentication/i.test(
+      message,
+    )
+  ) {
+    return new Error(
+      `${base}: SSH authentication failed. Check the username, password, or private key.${detail}`,
+    );
+  }
+  if (/closed before authentication completed/i.test(message)) {
+    return error;
+  }
+  return new Error(`${base}: ${message}`);
 }
 
 function authFingerprint(target: ResolvedProfile): string | undefined {

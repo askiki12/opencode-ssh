@@ -143,6 +143,8 @@ AGENTS.md                     Agent 使用约定（连接复用、profile、exec
 
 返回 `ssh_id`，例如 `ssh_1a2b3c4d5e6f`。连接阶段会通过 `progress` 上报 `resolving` / `reading-key` / `handshake` / `ready` 状态。
 
+连接失败会归一化为 `host not found` / `connection refused` / `timed out` / `authentication failed` 等提示，并带上目标 `user@host:port` 和底层错误；未知主机不会再只返回裸的 `getaddrinfo ENOTFOUND`。
+
 ```json
 { "profile_id": "prof_9f8e7d6c5b4a" }
 ```
@@ -198,6 +200,7 @@ AGENTS.md                     Agent 使用约定（连接复用、profile、exec
 - 当 sudo 报 “no tty present / a terminal is required” 时，会自动用 PTY 重试一次；
 - 所有命令在写入可选 sudo 密码后立即向 stdin 发送 EOF，包括 `tty: true`；因此 `cat`、`read` 或交互提示会收到 EOF，不会一直挂起；
 - `tty: true` 只分配 PTY，不是持久交互式 shell，也没有 send-stdin 工具；它适用于需要 TTY 检测/颜色但不需要持续输入的命令，一次性输入请用 shell 重定向/管道；读 `/dev/tty` 的程序仍可能需要 `timeout_ms`；
+- 后台进程会继承 channel 的 stdio；需要常驻时重定向 stdin/stdout/stderr 并 detach，否则 `ssh_exec` 返回或断线后可能退出；`ssh_job_start` 已内置 detach 和日志重定向；
 - 不默认注入 pager/颜色环境；对可能分页的命令（`git log`、`systemctl status`、`man`、`less`）设置 `non_interactive: true`，或通过 `env` 传 `PAGER=cat`、`GIT_PAGER=cat`、`SYSTEMD_PAGER=cat`、`NO_COLOR=1`、`TERM=dumb`；`env` 中的同名变量优先；
 - 命令失败（非 0 退出码）**不会**抛工具错误，而是把 `exit_code`、stdout、stderr 返回给模型，由模型自行判断；
 - stdout/stderr 会先清除 ANSI/OSC 控制序列，合并 `\r` 进度条和退格覆盖；
@@ -360,7 +363,7 @@ sudo 示例（需要 profile 或连接上保存了 `sudo_password`）：
 使用约定：
 
 - 长任务应使用 job，而不是把 `ssh_exec` 的 `timeout_ms` 调到几小时；
-- job 跟踪的是**前台命令**；如果命令自己 `nohup` / `&` / `docker run -d`，job 会立即结束，只记录了启动器；
+- job 跟踪的是**前台命令**，包括脚本内部用 `&` 启动并行子任务并 `wait` 的情况；只有“启动后立刻返回、把工作留在后台”的命令（如 `nohup cmd &`、`docker run -d`）会让 job 立即结束、只记录启动器。后者用 `ssh_exec` 时必须重定向全部 stdio 并 detach（例如 `nohup scp ... </dev/null >/tmp/scp.log 2>&1 &`），否则 channel 关闭后可能因 `EPIPE`/`SIGPIPE`/`SIGHUP` 退出；
 - 环境变量直接写在命令里：`export FOO=bar && python train.py`；
 - 任务结束后用 `ssh_remove` 删除 `job_dir` 做清理；
 - 只支持 POSIX 远端；
