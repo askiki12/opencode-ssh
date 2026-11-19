@@ -72,10 +72,11 @@ Rules that matter:
 - `ssh_read` reports `line_endings` and, for a complete file, its SHA-256. Pass that hash as `ssh_edit`'s `expected_sha256` to prevent overwriting a file changed by another process. `ssh_edit` also returns SHA-256 before/after. Matching is exact, including CRLF.
 - Before deleting a directory, call `ssh_remove` with `dry_run: true`, then repeat with `recursive: true`.
 - Write, edit, remove, and transfer trigger a path-level permission prompt; read, glob, and grep do not.
-- `ssh_grep` / `ssh_glob` need `rg`, `grep`, or `find` on the remote. If both `rg` and `grep` are missing, tell the user and offer to install ripgrep via `ssh_exec` (ask before installing). Never fall back to reading every file over SFTP.
-- `ssh_grep` skips hidden entries, `.git`, and `node_modules` by default; set `include_hidden: true` only when hidden files are actually needed.
+- `ssh_grep` needs `rg` or `grep`; `ssh_glob` prefers `rg`/`find` and falls back to an SFTP walk. If `ssh_grep` has neither, tell the user and offer to install ripgrep via `ssh_exec` (ask before installing). Never fall back to reading every file over SFTP for grep.
+- Both tools skip hidden entries, `.git`, and `node_modules` below the search root; an explicit path that is itself hidden or named `.git`/`node_modules` is searched. With ripgrep they also respect `.gitignore`/`.ignore`; use `include_hidden` / `include_ignored` to opt in. Fallback engines cannot read ignore files and warn that results may include them; `include_ignored` only suppresses that warning there.
+- `ssh_glob` uses path globs: `*.ts` matches the root level only, `**/*.ts` recurses. `ssh_grep`'s `include` is a file-name glob such as `*.ts`; use `path` to scope directories.
 - Do not download large files just to inspect them. Use `ssh_read` with `offset` / `limit` for small files; for later parts of a large file use `byte_offset` and `max_bytes`. `offset` is a line offset only from byte 0, and line numbers are unavailable in a byte-offset window.
-- `ssh_glob` / `ssh_grep` choose one engine and do not fall back on a legitimate zero result. Treat `truncated: yes` as an incomplete result and surface permission/path/command errors instead of assuming "no matches".
+- `ssh_glob` / `ssh_grep` choose one engine and do not fall back on a legitimate zero result. Treat `truncated: yes` or `incomplete: yes` as an incomplete result; read `warnings` before concluding "no matches".
 
 ## Long-running jobs
 
