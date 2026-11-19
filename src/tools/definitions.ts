@@ -5,6 +5,7 @@ import {
   DEFAULT_READ_BYTES,
   MAX_READ_BYTES,
   editRemoteFile,
+  needsRemoteHome,
   readRemoteFile,
   removeRemotePath,
   resolveRemotePath,
@@ -1742,8 +1743,12 @@ async function resolveTargetPath(
   sshId: string,
   value: unknown,
 ): Promise<string> {
+  const path = requireString(value, "path");
+  // Absolute paths do not need the remote home directory; only `~` forms do.
+  // This keeps search/file tools usable when the SFTP subsystem is unavailable.
+  if (!needsRemoteHome(path)) return resolveRemotePath(path, "");
   const home = await manager.homeDir(sshId);
-  return resolveRemotePath(requireString(value, "path"), home);
+  return resolveRemotePath(path, home);
 }
 
 async function assertPathPermission(

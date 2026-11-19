@@ -74,6 +74,12 @@ export interface RemotePathOptions {
   home: string;
 }
 
+/** True when resolving this path requires the remote home directory. */
+export function needsRemoteHome(input: string): boolean {
+  const value = input.trim();
+  return value === "~" || value.startsWith("~/");
+}
+
 /** Accept absolute paths and `~` forms only; relative paths are ambiguous. */
 export function resolveRemotePath(input: string, home: string): string {
   const value = input.trim();

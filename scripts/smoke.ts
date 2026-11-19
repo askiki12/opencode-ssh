@@ -22,6 +22,7 @@ import { createRpcHandlers } from "../src/rpc-handlers.js";
 import { buildRemoteCommand } from "../src/ssh/command.js";
 import {
   editRemoteFile,
+  needsRemoteHome,
   readRemoteFile,
   removeRemotePath,
   resolveRemotePath,
@@ -373,6 +374,10 @@ async function main() {
       () => resolveRemotePath("relative/x", "/home/tester"),
       /absolute/,
     );
+    assert.equal(needsRemoteHome("~"), true);
+    assert.equal(needsRemoteHome("~/x"), true);
+    assert.equal(needsRemoteHome("/work/x"), false);
+    assert.equal(needsRemoteHome("relative/x"), false);
 
     assert.equal(globToRegExp("**/*.ts").test("src/a.ts"), true);
     assert.equal(globToRegExp("**/*.ts").test("a.ts"), true);
@@ -1267,6 +1272,41 @@ async function main() {
       signal: new AbortController().signal,
       progress: async () => undefined,
     };
+
+    // Absolute paths must not require the remote home directory (and thus must
+    // not require an SFTP subsystem) for search tools.
+    const noHomeTools = new Map(
+      createSshTools({
+        manager: {
+          homeDir: async () => {
+            throw new Error("homeDir must not be called for absolute paths");
+          },
+        } as unknown as ConnectionManager,
+        profiles,
+        config,
+        search: {
+          glob: async (_sshId: string, options: { path: string }) => ({
+            engine: "rg" as const,
+            paths: [`${options.path}/a.ts`],
+            truncated: false,
+          }),
+        } as unknown as SearchService,
+        jobs: {} as JobService,
+      }).map((tool) => [tool.name, tool]),
+    );
+    const noHomeGlobResult = await requiredTool(noHomeTools, "glob").execute(
+      { ssh_id: "ssh_test", pattern: "**/*.ts", path: "/work" },
+      context,
+    );
+    assert.match(noHomeGlobResult.content, /\/work\/a\.ts/);
+    await assert.rejects(
+      () =>
+        requiredTool(noHomeTools, "glob").execute(
+          { ssh_id: "ssh_test", pattern: "**/*.ts", path: "relative/x" },
+          context,
+        ),
+      /absolute/,
+    );
 
     const connectResult = await requiredTool(byName, "connect").execute(
       {
