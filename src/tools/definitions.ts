@@ -359,7 +359,7 @@ const GREP_INPUT = {
     include: {
       type: "string",
       description:
-        "Only return matches whose file name matches this glob, for example *.ts. Matches names only; use path to scope directories.",
+        "Only return matches whose file name matches this glob, for example *.ts. Patterns containing / are rejected; use path to scope directories.",
     },
     literal: {
       type: "boolean",
@@ -1051,8 +1051,8 @@ export function createSshTools(
     {
       name: "glob",
       description:
-        "Find remote files matching a glob pattern under path (defaults to the remote home). Returns absolute paths for regular files. " +
-        "Skips hidden entries, .git, and node_modules below the root; with ripgrep also respects .gitignore/.ignore (include_hidden/include_ignored opt in). " +
+        "Find remote files matching a glob pattern under path (defaults to the remote home). Returns absolute paths for regular files; symbolic links are not followed. " +
+        "Skips hidden entries, .git, and node_modules below the root; with ripgrep also respects .gitignore/.ignore. " +
         "Chooses one engine and does not rescan on zero results; warnings/incomplete indicate errors or truncation. " +
         "Prefer this over find via ssh_exec.",
       input: GLOB_INPUT,
@@ -1146,8 +1146,8 @@ export function createSshTools(
       name: "grep",
       description:
         "Search remote file contents and return path:line:text. Chooses ripgrep or grep and does not rescan on zero matches. " +
-        "Skips hidden entries, .git, and node_modules below the root; with ripgrep also respects .gitignore/.ignore (include_hidden/include_ignored opt in). " +
-        "include filters file names, not directories. Invalid patterns are input errors; warnings/incomplete mean results may be partial. " +
+        "Skips hidden entries, .git, and node_modules below the root; with ripgrep also respects .gitignore/.ignore. " +
+        "include filters file names. Invalid patterns are input errors; warnings/incomplete mean results may be partial. " +
         "Prefer this over grep via ssh_exec.",
       input: GREP_INPUT,
       options: { namespace: "ssh", codemode: true },
