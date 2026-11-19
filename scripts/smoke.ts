@@ -893,6 +893,80 @@ async function main() {
     rmSync(jobRoot, { recursive: true, force: true });
   }
 
+  // Listing must return the newest jobs, not a lexicographic slice of random ids.
+  const orderRoot = mkdtempSync(path.join(tmpdir(), "opencode-ssh-job-order-"));
+  try {
+    const orderJobs = new JobService(new FakeJobConnections(orderRoot));
+    const orderBase = path.join(
+      orderRoot,
+      "home",
+      "tester",
+      ".opencode-ssh",
+      "jobs",
+    );
+    mkdirSync(orderBase, { recursive: true });
+    const firstStarted = 1_700_000_000;
+    for (let index = 0; index <= 100; index += 1) {
+      const jobId = `job_${index.toString(16).padStart(12, "0")}`;
+      const dir = path.join(orderBase, jobId);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        path.join(dir, "meta.json"),
+        `${JSON.stringify({ id: jobId })}\n`,
+      );
+      writeFileSync(
+        path.join(dir, "started_at"),
+        `${firstStarted + index}\n`,
+      );
+    }
+
+    const ordered = (await orderJobs.status(
+      "ssh_test",
+      undefined,
+      0,
+    )) as JobInfo[];
+    const newest = `job_${(100).toString(16).padStart(12, "0")}`;
+    const oldest = `job_${(0).toString(16).padStart(12, "0")}`;
+    assert.equal(ordered.length, 100);
+    assert.equal(ordered[0]?.jobId, newest);
+    assert.equal(ordered.some((job) => job.jobId === oldest), false);
+  } finally {
+    rmSync(orderRoot, { recursive: true, force: true });
+  }
+
+  // Each pid must be checked against its own job directory, so a reused pid
+  // does not make an unrelated process look like a running job.
+  const reuseRoot = mkdtempSync(path.join(tmpdir(), "opencode-ssh-job-reuse-"));
+  try {
+    const harness = new FakeJobConnections(reuseRoot);
+    const jobs = new JobService(harness);
+    const base = path.join(
+      reuseRoot,
+      "home",
+      "tester",
+      ".opencode-ssh",
+      "jobs",
+    );
+    const jobA = "job_aaaaaaaaaaaa";
+    const jobB = "job_bbbbbbbbbbbb";
+    const dirA = writeJobFixture(base, jobA, 1111, 1_700_000_000);
+    writeJobFixture(base, jobB, 2222, 1_700_000_001);
+    harness.processArgs.set(1111, `/bin/sh ${dirA}/job.sh`);
+    harness.processArgs.set(2222, "/usr/bin/unrelated");
+
+    const listed = (await jobs.status(
+      "ssh_test",
+      undefined,
+      0,
+    )) as JobInfo[];
+    const foundA = listed.find((job) => job.jobId === jobA);
+    const foundB = listed.find((job) => job.jobId === jobB);
+    assert.equal(foundA?.state, "running");
+    assert.equal(foundB?.state, "lost");
+  } finally {
+    rmSync(reuseRoot, { recursive: true, force: true });
+  }
+
   const connectTarget = { user: "tester", host: "as", port: 22 };
   const dnsError = Object.assign(
     new Error("getaddrinfo ENOTFOUND as"),
@@ -1690,6 +1764,20 @@ async function captureError(run: () => Promise<unknown>): Promise<string> {
   }
 }
 
+function writeJobFixture(
+  base: string,
+  jobId: string,
+  pid: number,
+  startedAt: number,
+): string {
+  const dir = path.join(base, jobId);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, "meta.json"), `${JSON.stringify({ id: jobId })}\n`);
+  writeFileSync(path.join(dir, "pid"), `${pid}\n`);
+  writeFileSync(path.join(dir, "started_at"), `${startedAt}\n`);
+  return `/home/tester/.opencode-ssh/jobs/${jobId}`;
+}
+
 /**
  * Simulates the remote side of a job: the launch command writes pid/started_at,
  * probes report liveness, and stop returns a scripted outcome.
@@ -1698,6 +1786,7 @@ class FakeJobConnections implements JobConnections {
   private readonly sftpStore;
   alive = true;
   stopAnswer: "stopped" | "not-running" | "mismatch" = "stopped";
+  readonly processArgs = new Map<number, string>();
   readonly now = Math.floor(Date.now() / 1_000);
 
   constructor(private readonly root: string) {
@@ -1740,13 +1829,35 @@ class FakeJobConnections implements JobConnections {
       return Promise.resolve(result("log-1\nlog-2\n"));
     }
     if (command.includes('echo "now=')) {
-      return Promise.resolve(
-        result(
-          this.alive
-            ? `now=${this.now}\n4242=alive\n4242=match\n`
-            : `now=${this.now}\n4242=dead\n`,
-        ),
+      const pids = [...command.matchAll(/kill -0 (\d+)/g)].map((match) =>
+        Number(match[1]),
       );
+      const expectedDirs = new Map<number, string>();
+      for (const match of command.matchAll(
+        /ps -p (\d+) -o args= 2>\/dev\/null\)" in \*'([^']*)'/g,
+      )) {
+        const pid = Number(match[1]);
+        const dir = match[2];
+        if (dir !== undefined) expectedDirs.set(pid, dir);
+      }
+
+      const lines = [`now=${this.now}`];
+      for (const pid of pids) {
+        if (!this.alive) {
+          lines.push(`${pid}=dead`);
+          continue;
+        }
+        lines.push(`${pid}=alive`);
+        const expectedDir = expectedDirs.get(pid);
+        const args = this.processArgs.get(pid);
+        if (
+          expectedDir !== undefined &&
+          (args === undefined || args.includes(expectedDir))
+        ) {
+          lines.push(`${pid}=match`);
+        }
+      }
+      return Promise.resolve(result(`${lines.join("\n")}\n`));
     }
     if (command.includes("kill -TERM")) {
       return Promise.resolve(

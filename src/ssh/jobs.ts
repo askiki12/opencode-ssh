@@ -257,7 +257,11 @@ export class JobService {
       return info;
     }
 
-    const probe = await this.probeProcesses(sshId, [pid], jobDir);
+    const probe = await this.probeProcesses(
+      sshId,
+      [pid],
+      new Map([[pid, jobDir]]),
+    );
     const now = probe.now;
     if (startedAt !== undefined) info.elapsedMs = Math.max(0, now - startedAt * 1_000);
     if (!probe.alive.has(pid)) {
@@ -276,9 +280,25 @@ export class JobService {
     const entries = await readdir(sftp, base);
     if (entries.length === 0) return [];
 
-    const jobIds = entries
+    const candidates = entries
       .filter((entry) => JOB_ID_PATTERN.test(entry) && !entry.startsWith("."))
-      .sort()
+      .sort();
+
+    const startedTimes = new Map<string, number>();
+    for (const jobId of candidates) {
+      const startedAt = await readNumber(
+        sftp,
+        posix.join(base, jobId, "started_at"),
+      );
+      if (startedAt !== undefined) startedTimes.set(jobId, startedAt);
+    }
+    // Job ids are random, so a lexicographic slice would hide recent jobs once
+    // there are more than MAX_LISTED_JOBS directories. Select the newest ones.
+    const jobIds = candidates
+      .sort(
+        (left, right) =>
+          (startedTimes.get(right) ?? 0) - (startedTimes.get(left) ?? 0),
+      )
       .slice(0, MAX_LISTED_JOBS);
 
     const infos: JobInfo[] = [];
@@ -300,7 +320,7 @@ export class JobService {
       const exitCode = await readNumber(sftp, posix.join(jobDir, "exit_code"));
       const stoppedAt = await readNumber(sftp, posix.join(jobDir, "stopped_at"));
       const pid = await readNumber(sftp, posix.join(jobDir, "pid"));
-      const startedAt = await readNumber(sftp, posix.join(jobDir, "started_at"));
+      const startedAt = startedTimes.get(jobId);
       if (pid !== undefined) info.pid = pid;
       if (startedAt !== undefined) {
         info.startedAt = new Date(startedAt * 1_000).toISOString();
@@ -321,7 +341,11 @@ export class JobService {
       .map((info) => info.pid)
       .filter((pid): pid is number => pid !== undefined);
     if (pids.length > 0) {
-      const probe = await this.probeProcesses(sshId, pids);
+      const expectedDirs = new Map<number, string>();
+      for (const info of infos) {
+        if (info.pid !== undefined) expectedDirs.set(info.pid, info.jobDir);
+      }
+      const probe = await this.probeProcesses(sshId, pids, expectedDirs);
       for (const info of infos) {
         if (
           info.pid === undefined ||
@@ -353,7 +377,7 @@ export class JobService {
   private async probeProcesses(
     sshId: string,
     pids: number[],
-    expectedDir?: string,
+    expectedDirs?: ReadonlyMap<number, string>,
   ): Promise<{ now: number; alive: Set<number>; matching: Set<number> }> {
     const alive = new Set<number>();
     const matching = new Set<number>();
@@ -362,6 +386,7 @@ export class JobService {
       lines.push(
         `if kill -0 ${pid} 2>/dev/null; then echo "${pid}=alive"; else echo "${pid}=dead"; fi;`,
       );
+      const expectedDir = expectedDirs?.get(pid);
       if (expectedDir !== undefined) {
         lines.push(
           `case "$(ps -p ${pid} -o args= 2>/dev/null)" in *${shellQuote(expectedDir)}*) echo "${pid}=match";; esac;`,
@@ -392,9 +417,11 @@ export class JobService {
       }
     }
 
-    // Without an expected directory we cannot check the command line; treat
-    // every live pid as matching.
-    if (expectedDir === undefined) {
+    // Without an expected directory for a pid we cannot check the command
+    // line; treat live pids as matching only in that case. When a job
+    // directory is known, an unrelated process that reused the pid stays
+    // unmatched so the job is reported as lost instead of running.
+    if (expectedDirs === undefined) {
       for (const pid of alive) matching.add(pid);
     }
     return { now, alive, matching };
