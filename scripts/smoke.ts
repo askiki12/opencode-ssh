@@ -395,6 +395,19 @@ async function main() {
     assert.equal(truncatedGrepResult.matches.length, 1);
     assert.equal(truncatedGrepResult.truncated, true);
 
+    const fallbackGrep = fakeSearchManager([
+      fakeExecResult("rg=0\ngrep=1\nfind=0\n"),
+      fakeExecResult("/work/a.ts:1:needle\n"),
+    ]);
+    const fallbackGrepResult = await new SearchService(
+      fallbackGrep.manager,
+    ).grep("ssh_test", { pattern: "needle", path: "/work/a.ts" });
+    assert.equal(fallbackGrepResult.engine, "grep");
+    assert.deepEqual(fallbackGrepResult.matches, [
+      { path: "/work/a.ts", line: 1, text: "needle" },
+    ]);
+    assert.match(fallbackGrep.calls[1] ?? "", /-H/);
+
     const failedFind = fakeSearchManager([
       fakeExecResult("rg=0\ngrep=1\nfind=1\n"),
       fakeExecResult("", 1),

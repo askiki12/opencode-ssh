@@ -199,6 +199,9 @@ export class SearchService {
   ): Promise<GrepResult> {
     const flags = [
       "-rIn",
+      // Force the filename prefix. grep omits it for a single file operand,
+      // which would make the path:line:text output below unparseable.
+      "-H",
       "--color=never",
       "--exclude-dir=.git",
       "--exclude-dir=node_modules",
