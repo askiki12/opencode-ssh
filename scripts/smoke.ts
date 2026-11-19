@@ -43,6 +43,7 @@ import {
   normalizeHomeDir,
   type ExecResult,
 } from "../src/ssh/manager.js";
+import { compileGlob, InvalidGlobPatternError } from "../src/ssh/glob.js";
 import { globToRegExp, SearchService } from "../src/ssh/search.js";
 import { createSshTools, type ToolDefinition } from "../src/tools/definitions.js";
 import { OutputCollector } from "../src/util.js";
@@ -379,11 +380,31 @@ async function main() {
     assert.equal(needsRemoteHome("/work/x"), false);
     assert.equal(needsRemoteHome("relative/x"), false);
 
-    assert.equal(globToRegExp("**/*.ts").test("src/a.ts"), true);
-    assert.equal(globToRegExp("**/*.ts").test("a.ts"), true);
-    assert.equal(globToRegExp("src/**/*.{js,jsx}").test("src/x/y.js"), true);
-    assert.equal(globToRegExp("src/**/*.{js,jsx}").test("src/x/y.ts"), false);
-    assert.equal(globToRegExp("*.md").test("docs/a.md"), false);
+    const matchTs = compileGlob("**/*.ts");
+    assert.equal(matchTs("src/a.ts"), true);
+    assert.equal(matchTs("a.ts"), true);
+    const matchJs = compileGlob("src/**/*.{js,jsx}");
+    assert.equal(matchJs("src/x/y.js"), true);
+    assert.equal(matchJs("src/x/y.ts"), false);
+    assert.equal(compileGlob("*.md")("docs/a.md"), false);
+    assert.equal(compileGlob("*.md")("a.md"), true);
+    const matchNested = compileGlob("{a,b{c,d}}");
+    assert.equal(matchNested("a"), true);
+    assert.equal(matchNested("bc"), true);
+    assert.equal(matchNested("bd"), true);
+    assert.equal(matchNested("b{c,d}"), false);
+    assert.equal(compileGlob("[[:alpha:]].ts")("a.ts"), true);
+    assert.equal(compileGlob("[[:alpha:]].ts")("1.ts"), false);
+    assert.equal(compileGlob("a\\*b")("a*b"), true);
+    assert.equal(compileGlob("a\\*b")("axb"), false);
+    assert.throws(
+      () => compileGlob("[z-a].ts"),
+      (error: unknown) => error instanceof InvalidGlobPatternError,
+    );
+    assert.throws(
+      () => compileGlob("a{b,c"),
+      (error: unknown) => error instanceof InvalidGlobPatternError,
+    );
 
     const zeroGlob = fakeSearchManager([
       fakeExecResult("rg=1\ngrep=1\nfind=1\n"),
