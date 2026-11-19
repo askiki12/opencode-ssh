@@ -550,8 +550,9 @@ async function uploadEntry(
     );
     throw error;
   }
+  // Bytes are counted by progressStream as the file streams through; adding
+  // stats.size here would double-count them.
   totals.files += 1;
-  totals.bytes += stats.size;
 }
 
 async function downloadEntry(
@@ -616,7 +617,6 @@ async function downloadEntry(
     throw error;
   }
   totals.files += 1;
-  totals.bytes += stats.size;
 }
 
 function progressStream(

@@ -587,6 +587,7 @@ async function main() {
       onProgress: (update) => uploadProgress.push(update),
     });
     assert.equal(upload.files, 2);
+    assert.equal(upload.bytes, 22);
     assert.ok(uploadProgress.length > 0);
     assert.equal(uploadProgress.at(-1)?.direction, "upload");
     assert.ok((uploadProgress.at(-1)?.bytes ?? 0) > 0);
@@ -631,6 +632,7 @@ async function main() {
       onProgress: (update) => downloadProgress.push(update),
     });
     assert.equal(download.files, 2);
+    assert.equal(download.bytes, 22);
     assert.ok(downloadProgress.length > 0);
     assert.equal(downloadProgress.at(-1)?.direction, "download");
     assert.ok((downloadProgress.at(-1)?.bytes ?? 0) > 0);
