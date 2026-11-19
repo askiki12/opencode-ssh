@@ -228,19 +228,29 @@ export class ConnectionManager {
     });
 
     const hostVerifier = (key: unknown): boolean => {
-      const raw =
-        typeof key === "string"
-          ? key
-          : Buffer.from(key as Uint8Array).toString("hex");
-      fingerprintHex = raw;
-      const accepted = this.knownHosts.verify(
-        target.host,
-        target.port,
-        raw,
-        target.hostKeyPolicy,
-      );
-      if (!accepted) hostKeyError = this.knownHosts.takeError();
-      return accepted;
+      try {
+        const raw =
+          typeof key === "string"
+            ? key
+            : Buffer.from(key as Uint8Array).toString("hex");
+        fingerprintHex = raw;
+        const accepted = this.knownHosts.verify(
+          target.host,
+          target.port,
+          raw,
+          target.hostKeyPolicy,
+        );
+        if (!accepted) hostKeyError = this.knownHosts.takeError();
+        return accepted;
+      } catch (error) {
+        // This callback runs inside ssh2's synchronous handshake stack. A throw
+        // would escape as an uncaught exception instead of a connection error,
+        // so report it as a rejected host key.
+        hostKeyError =
+          `Unable to verify the SSH host key for ` +
+          `${target.user}@${target.host}:${target.port}: ${errorMessage(error)}`;
+        return false;
+      }
     };
 
     const connectConfig: ConnectConfig = {
