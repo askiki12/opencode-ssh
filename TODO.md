@@ -14,6 +14,16 @@
 
 ### P1
 
+- [ ] **`ssh_job_start` 无法使用已保存的 sudo 密码**
+  - 现状：`ssh_job_start` 只把命令写入 `job.sh`，启动命令把 stdin 重定向到 `/dev/null`（`src/ssh/jobs.ts` 的 `buildJobScript` / `buildLaunchCommand`）；它不复用连接或 profile 上的 `sudo_password`，也没有 `sudo` / `as_user` 参数。
+  - 影响：非 NOPASSWD 的远端无法用 job 工具执行需要 sudo 的长任务（训练、部署、迁移）；只能退回 `ssh_exec` 并拉长 `timeout_ms`，与 AGENTS 中“长任务用 `ssh_job_start`”的建议冲突。若手动把密码写进命令，会出现在命令行、`job.sh` 或日志里。
+  - 预期：为 `ssh_job_start` 增加 `sudo` / `as_user`；在启动阶段通过 stdin 使用连接上的 sudo 密码；密码不得写入 `job.sh`、`meta.json`、`output.log` 或进程参数；同时明确 `ssh_job_stop` / `ssh_job_status` 对特权进程的权限处理（能安全发信号，或明确拒绝并提示）。
+
+- [ ] **sudo 密码无条件写入 stdin（安全风险，待修复）**
+  - 现象：`ssh_exec({ sudo: true })` / `as_user` 只要连接或目标上有 `sudo_password`，无论远端是否 NOPASSWD，都会把密码写入 channel stdin（`src/ssh/manager.ts` 的 `execOnce`）。
+  - 风险：sudo 不需要密码时不会读取 stdin，密码会残留给被执行的命令（如 `sudo cat`、`sudo tee`），命令可把它写到文件或通过网络发出；工具输出侧的 `redactSecret` 只能保护 stdout/stderr，无法阻止副作用。
+  - 预期：仅在检测到 sudo 提示时发送密码，或在 `sh -c` 内把命令 stdin 重定向到 `/dev/null`（本插件不支持交互 stdin）；同时保持 NOPASSWD 场景下命令不读取密码的行为。
+
 - [ ] **补充真实服务器回归**
   - 现有 `scripts/smoke.ts`、`scripts/tui-smoke.ts` 都基于本地 ssh2 测试服务器。
   - 已在真实 Linux 主机（root + 私钥）手工验证：
@@ -123,3 +133,4 @@
 - 2026-11-13：`ssh_grep` 默认跳过隐藏项、`.git`、`node_modules`，新增 `include_hidden`；`ssh_write` / `ssh_edit` 拒绝 symlink，说明 mode/ownership/ACL/xattr 限制；`ssh_edit` 增加前后 SHA-256、`expected_sha256` 和 CRLF 精确匹配提示；`ssh_write` / `ssh_edit`、`ssh_read` 报告 line endings，CRLF 时警告。
 - 2026-11-13：文档与工具描述对齐：补齐 files/search/jobs/errors 分层、移除“不支持 SFTP”的过期限制、补齐 profile revision/stale、job 状态与 no job_kill、tty/pager/取消/读文件 hash/line endings 等风险提示；TUI 手动连接不再复用 stale 连接。
 - 2026-11-13：连接错误归一化：`ENOTFOUND` / `ECONNREFUSED` / `ETIMEDOUT` / unreachable / reset / 认证失败带 `user@host:port` 和恢复提示；host key mismatch 和私钥读取错误保持专用提示。
+- 2026-11-19：验收 baseline 低风险修复（`feat/baseline-safe-fixes`）：host key 校验异常兜底、transfer 字节计数去重、NUL 输出与截断边界、grep `-H`、homeDir 的 SFTP → exec 回退（含 exitCode/输出校验）、绝对路径跳过 homeDir、job 列表最近 100 个与按 job 目录校验 pid。搜索错误语义、本地 glob 匹配和工具描述改动尚未验收。
