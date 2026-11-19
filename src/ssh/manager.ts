@@ -83,6 +83,12 @@ export interface ExecInput {
   timeoutMs?: number;
   tty?: boolean;
   maxOutputBytes?: number;
+  /**
+   * Keep stdout/stderr byte-for-byte instead of stripping terminal control
+   * sequences. Internal machine-readable commands (for example NUL-separated
+   * glob results) need this; it is not exposed through the ssh_exec tool.
+   */
+  rawOutput?: boolean;
   /** Inject pager/color guards so the command cannot block on a pager. */
   nonInteractive?: boolean;
   /** Called at most about once per second with a bounded output snapshot. */
@@ -154,6 +160,7 @@ interface ExecOnceOptions {
   timeoutMs: number;
   maxOutputBytes: number;
   usesSudo: boolean;
+  rawOutput?: boolean;
   signal?: AbortSignal;
   onProgress?: (update: ExecProgress) => void;
 }
@@ -543,6 +550,7 @@ export class ConnectionManager {
         timeoutMs,
         maxOutputBytes,
         usesSudo: built.usesSudo,
+        rawOutput: input.rawOutput === true,
         ...(signal !== undefined ? { signal } : {}),
         ...(input.onProgress !== undefined
           ? { onProgress: input.onProgress }
@@ -560,6 +568,7 @@ export class ConnectionManager {
           timeoutMs,
           maxOutputBytes,
           usesSudo: true,
+          rawOutput: input.rawOutput === true,
           ...(signal !== undefined ? { signal } : {}),
           ...(input.onProgress !== undefined
             ? { onProgress: input.onProgress }
@@ -633,8 +642,12 @@ export class ConnectionManager {
       let exitCode: number | null = null;
       let signalName: string | undefined;
       const startedAt = Date.now();
-      const stdout = new OutputCollector(options.maxOutputBytes);
-      const stderr = new OutputCollector(options.maxOutputBytes);
+      const stdout = new OutputCollector(options.maxOutputBytes, {
+        raw: options.rawOutput === true,
+      });
+      const stderr = new OutputCollector(options.maxOutputBytes, {
+        raw: options.rawOutput === true,
+      });
 
       const reportProgress = () => {
         if (settled || options.onProgress === undefined) return;

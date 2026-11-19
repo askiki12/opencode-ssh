@@ -275,6 +275,8 @@ export class SearchService {
         cwd: options.path,
         timeoutMs: SEARCH_TIMEOUT_MS,
         maxOutputBytes: SEARCH_MAX_BYTES,
+        // -0 output is NUL-separated; terminal sanitization would strip it.
+        rawOutput: true,
       },
       signal,
     );
@@ -284,7 +286,7 @@ export class SearchService {
       throw new Error(commandFailure("rg", result));
     }
 
-    const paths = splitNul(result.stdout)
+    const paths = splitNulOutput(result.stdout, result.truncated)
       .filter((entry) => entry.length > 0)
       .map((entry) => posix.join(options.path, entry))
       .sort();
@@ -329,6 +331,8 @@ export class SearchService {
         "-print0",
       ],
       signal,
+      // -print0 output is NUL-separated; keep the separators intact.
+      true,
     );
     if (result.exitCode !== 0) {
       throw new Error(commandFailure("find", result));
@@ -336,7 +340,7 @@ export class SearchService {
 
     const matcher = globToRegExp(options.pattern);
     const paths: string[] = [];
-    for (const entry of splitNul(result.stdout)) {
+    for (const entry of splitNulOutput(result.stdout, result.truncated)) {
       if (entry.length === 0) continue;
       const relative = relativeTo(options.path, entry);
       if (isIgnored(relative, options.includeHidden !== true)) continue;
@@ -399,6 +403,7 @@ export class SearchService {
     sshId: string,
     argv: string[],
     signal?: AbortSignal,
+    rawOutput = false,
   ): Promise<ExecResult> {
     return this.manager.exec(
       {
@@ -406,6 +411,7 @@ export class SearchService {
         command: argv.join(" "),
         timeoutMs: SEARCH_TIMEOUT_MS,
         maxOutputBytes: SEARCH_MAX_BYTES,
+        rawOutput,
       },
       signal,
     );
@@ -556,6 +562,28 @@ function commandFailure(tool: string, result: ExecResult): string {
 
 function splitNul(value: string): string[] {
   return value.split("\u0000").filter((entry) => entry.length > 0);
+}
+
+/**
+ * Split NUL-separated output, discarding partial entries at a truncation
+ * boundary. OutputCollector keeps the head and tail with a text marker in
+ * between; without this, the last head fragment and first tail fragment would
+ * be merged into one bogus path.
+ */
+function splitNulOutput(value: string, truncated: boolean): string[] {
+  if (!truncated) return splitNul(value);
+  const markerStart = value.indexOf("\n[... ");
+  if (markerStart === -1) return splitNul(value);
+  const markerEnd = value.indexOf("]\n", markerStart);
+  if (markerEnd === -1) return [];
+
+  const headRaw = value.slice(0, markerStart);
+  const tailRaw = value.slice(markerEnd + 2);
+  const head = headRaw.length === 0 ? [] : headRaw.split("\u0000");
+  const tail = tailRaw.length === 0 ? [] : tailRaw.split("\u0000");
+  if (head.length > 0 && !headRaw.endsWith("\u0000")) head.pop();
+  if (tail.length > 0 && !tailRaw.startsWith("\u0000")) tail.shift();
+  return [...head, ...tail].filter((entry) => entry.length > 0);
 }
 
 function callSftp(

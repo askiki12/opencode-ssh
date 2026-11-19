@@ -211,6 +211,15 @@ class TerminalSanitizer {
   }
 }
 
+export interface OutputCollectorOptions {
+  /**
+   * Keep output byte-for-byte instead of stripping terminal control
+   * sequences. Use this only for machine-readable output that depends on
+   * control bytes, such as NUL-separated file lists.
+   */
+  raw?: boolean;
+}
+
 /**
  * Collects a bounded amount of process output. It strips terminal control
  * sequences, collapses progress-bar rewrites, and keeps both the beginning and
@@ -225,24 +234,32 @@ export class OutputCollector {
   private tailBytes = 0;
   private receivedBytes = 0;
   private cleanedBytes = 0;
-  private readonly sanitizer: TerminalSanitizer;
+  private readonly sanitizer: TerminalSanitizer | undefined;
 
-  constructor(limitBytes: number) {
+  constructor(limitBytes: number, options: OutputCollectorOptions = {}) {
     const limit = Math.max(1, Math.trunc(limitBytes));
     this.headLimit = Math.min(limit, Math.max(64, Math.floor(limit / 4)));
     this.tailLimit = limit - this.headLimit;
-    this.sanitizer = new TerminalSanitizer((text) => this.add(text));
+    this.sanitizer =
+      options.raw === true
+        ? undefined
+        : new TerminalSanitizer((text) => this.add(text));
   }
 
   append(chunk: Buffer | string): void {
     const buffer = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk;
     this.receivedBytes += buffer.length;
-    this.sanitizer.write(buffer);
+    if (this.sanitizer !== undefined) {
+      this.sanitizer.write(buffer);
+    } else if (buffer.length > 0) {
+      this.cleanedBytes += buffer.length;
+      this.stow(buffer);
+    }
   }
 
   /** Flush the sanitizer's pending line. Call once when the stream closes. */
   end(): void {
-    this.sanitizer.end();
+    this.sanitizer?.end();
   }
 
   text(): string {
@@ -277,7 +294,7 @@ export class OutputCollector {
       remaining -= take;
     }
     const text = Buffer.concat(selected).toString("utf8");
-    const pending = this.sanitizer.preview();
+    const pending = this.sanitizer?.preview() ?? "";
     if (pending.length === 0) return text;
     return `${text}${pending}`.slice(-limit);
   }
@@ -303,7 +320,11 @@ export class OutputCollector {
   private add(text: string): void {
     if (text.length === 0) return;
     this.cleanedBytes += Buffer.byteLength(text, "utf8");
-    let buffer = Buffer.from(text, "utf8");
+    this.stow(Buffer.from(text, "utf8"));
+  }
+
+  private stow(buffer: Buffer): void {
+    if (buffer.length === 0) return;
 
     if (this.headBytes < this.headLimit) {
       const room = this.headLimit - this.headBytes;

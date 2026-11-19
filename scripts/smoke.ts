@@ -170,6 +170,13 @@ async function main() {
   assert.equal(sanitized.text(), "red ok\nprogress 100%\naX");
   assert.equal(sanitized.truncated, false);
 
+  // NUL-separated machine output must survive; the default sanitizer drops
+  // control bytes, which would merge every glob path into one string.
+  const rawCollector = new OutputCollector(1024, { raw: true });
+  rawCollector.append(Buffer.from("/work/a.ts\u0000/work/b.ts\u0000"));
+  rawCollector.end();
+  assert.equal(rawCollector.text(), "/work/a.ts\u0000/work/b.ts\u0000");
+
   const bounded = new OutputCollector(1024);
   for (let index = 0; index < 200; index += 1) {
     bounded.append(`line ${index.toString().padStart(4, "0")}\n`);
@@ -292,6 +299,24 @@ async function main() {
     assert.deepEqual(zeroGlobResult.paths, []);
     assert.equal(zeroGlob.calls.length, 2);
     assert.equal(zeroGlob.signals[1], zeroGlobSignal);
+    assert.equal(zeroGlob.rawOutputs[1], true);
+
+    const truncatedGlob = fakeSearchManager([
+      fakeExecResult("rg=1\ngrep=1\nfind=1\n"),
+      fakeExecResult(
+        "a.ts\u0000part\n[... 10 bytes omitted; showing beginning and end ...]\nial.ts\u0000b.ts\u0000",
+        0,
+        true,
+      ),
+    ]);
+    const truncatedGlobResult = await new SearchService(
+      truncatedGlob.manager,
+    ).glob("ssh_test", { pattern: "**/*.ts", path: "/work" });
+    assert.deepEqual(truncatedGlobResult.paths, [
+      "/work/a.ts",
+      "/work/b.ts",
+    ]);
+    assert.equal(truncatedGlobResult.truncated, true);
 
     const findGlob = fakeSearchManager([
       fakeExecResult("rg=0\ngrep=1\nfind=1\n"),
@@ -1361,13 +1386,19 @@ function fakeSearchManager(results: ExecResult[]): {
   manager: ConnectionManager;
   calls: string[];
   signals: Array<AbortSignal | undefined>;
+  rawOutputs: Array<boolean | undefined>;
 } {
   const calls: string[] = [];
   const signals: Array<AbortSignal | undefined> = [];
+  const rawOutputs: Array<boolean | undefined> = [];
   const manager = {
-    exec: async (input: { command: string }, signal?: AbortSignal) => {
+    exec: async (
+      input: { command: string; rawOutput?: boolean },
+      signal?: AbortSignal,
+    ) => {
       calls.push(input.command);
       signals.push(signal);
+      rawOutputs.push(input.rawOutput);
       const next = results.shift();
       if (next === undefined) {
         throw new Error(`unexpected search exec: ${input.command}`);
@@ -1382,6 +1413,7 @@ function fakeSearchManager(results: ExecResult[]): {
     manager: manager as unknown as ConnectionManager,
     calls,
     signals,
+    rawOutputs,
   };
 }
 
