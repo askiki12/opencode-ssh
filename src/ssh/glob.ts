@@ -16,10 +16,11 @@ export class InvalidGlobPatternError extends Error {
 
 export type GlobMatcher = (relativePath: string) => boolean;
 
-const OPTIONS: picomatch.PicomatchOptions = {
+const OPTIONS = {
   dot: true,
   nonegate: true,
-};
+  nocomment: true,
+} as picomatch.PicomatchOptions;
 
 /**
  * Compile a POSIX-path glob using picomatch. Matching is always done against a
