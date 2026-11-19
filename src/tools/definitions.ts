@@ -475,7 +475,7 @@ const JOB_STATUS_INPUT = {
     job_id: {
       type: "string",
       description:
-        "Job to inspect. Omit to list all jobs created by this plugin for the current user.",
+        "Job to inspect. Omit to list the 100 most recent jobs created by this plugin for the current user.",
     },
     log_lines: {
       type: "integer",
@@ -759,7 +759,7 @@ export function createSshTools(
       description:
         "Execute a command over a persistent SSH connection. Returns the exit code, stdout, and stderr. " +
         "Use an ssh_id from ssh_connect or ssh_list; prefer reusing an existing connection instead of connecting again. " +
-        "For long-running foreground work, prefer ssh_job_start so the job and log survive disconnect; use ssh_exec for short commands or work you explicitly detach and manage yourself. " +
+        "For long-running foreground work, prefer ssh_job_start (survival across disconnect depends on the remote having setsid); use ssh_exec for short commands or work you explicitly detach and manage yourself. " +
         "Each call opens a new channel, so shell state such as cd/export does not persist; use cwd and env instead. " +
         "tty=true allocates a PTY but does not provide interactive stdin; stdin closes immediately, so use it for TTY detection/color, not for prompts. " +
         "Background processes inherit the SSH channel's stdout/stderr; if they outlive this call they can hit EPIPE/SIGPIPE or SIGHUP. Redirect stdin/stdout/stderr and detach, or use ssh_job_start. " +
@@ -1372,13 +1372,12 @@ export function createSshTools(
       name: "job_start",
       description:
         "Start a long-running remote command detached from the SSH channel and return a job_id. " +
-        "Use this for tasks that outlive one tool call (training, builds, migrations) instead of raising ssh_exec timeout_ms. " +
-        "The process survives disconnect and OpenCode restarts. " +
-        "Environment variables go inline in the command (export FOO=bar && ...). " +
-        "Run a foreground command. Scripts that start parallel children and wait for them (for example `&` + `wait`) are still foreground and are good candidates. Avoid ssh_job_start only when the command returns immediately and leaves detached work behind (for example `nohup cmd &` then exit): the job would finish immediately and track only the launcher. In that case use ssh_exec with stdin/stdout/stderr redirected and detached. " +
-        "Only the host process is tracked; containers keep their own lifecycle, so decide separately whether to stop or leave them running. " +
-        "Cancelling this tool call or disconnecting does not stop the job; use ssh_job_stop for that. " +
-        "Inspect with ssh_job_status, terminate with ssh_job_stop, clean up with ssh_remove on job_dir. POSIX remotes only.",
+        "Use this for tasks that outlive one tool call instead of raising ssh_exec timeout_ms; it runs as the SSH login user and has no sudo/as_user options or stored sudo password. " +
+        "On hosts with setsid (most Linux/BSD) it survives disconnect/OpenCode restarts; without setsid (for example base macOS) detachment is best-effort. " +
+        "Run a foreground command. Scripts that fan out and wait (for example `&` + `wait`) are fine. Avoid commands that return immediately and leave detached work behind (for example `nohup cmd &`): the job tracks only the launcher; use ssh_exec for those. " +
+        "Only the host process is tracked; containers keep their own lifecycle. " +
+        "Cancelling this call does not stop the job; with setsid, disconnecting does not either. Use ssh_job_stop to terminate it. " +
+        "Inspect with ssh_job_status and clean up with ssh_remove on job_dir. POSIX remotes only.",
       input: JOB_START_INPUT,
       options: { namespace: "ssh", codemode: true },
       execute: async (raw, context) => {
@@ -1415,8 +1414,8 @@ export function createSshTools(
     {
       name: "job_status",
       description:
-        "Check a job started by ssh_job_start, or list all jobs when job_id is omitted. " +
-        "States: starting, running, finished (has exit_code), stopped (terminated by ssh_job_stop), lost (process gone without exit_code), corrupt. " +
+        "Check a job started by ssh_job_start, or list the 100 most recent jobs when job_id is omitted. " +
+        "States: starting, running, finished (has exit_code), stopped (terminated by ssh_job_stop), lost (process gone or the pid no longer belongs to the job), corrupt (missing or invalid meta.json). " +
         "Pass log_lines to include the tail of output.log. " +
         "Finished jobs keep their logs until you remove their job_dir with ssh_remove.",
       input: JOB_STATUS_INPUT,

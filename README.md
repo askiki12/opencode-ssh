@@ -342,7 +342,7 @@ sudo 示例（需要 profile 或连接上保存了 `sudo_password`）：
 | 工具 | 用途 |
 | --- | --- |
 | `ssh_job_start` | 后台启动命令，立即返回 `job_id`、pid、job 目录和日志路径 |
-| `ssh_job_status` | 查询单个 job；省略 `job_id` 时列出全部 job；`log_lines` 取日志尾部 |
+| `ssh_job_status` | 查询单个 job；省略 `job_id` 时列出最近 100 个 job；`log_lines` 取日志尾部 |
 | `ssh_job_stop` | 先 `SIGTERM`，宽限后 `SIGKILL`，按进程组终止 |
 
 状态：
@@ -351,8 +351,8 @@ sudo 示例（需要 profile 或连接上保存了 `sudo_password`）：
 - `running`：进程存活且命令行匹配 job 目录；
 - `finished`：有 `exit_code`；
 - `stopped`：被 `ssh_job_stop` 终止；
-- `lost`：进程消失且没有退出码（重启、OOM、外部 kill）；
-- `corrupt`：目录存在但 `meta.json` 缺失。
+- `lost`：进程消失、pid 被复用或命令行不再匹配 job 目录，且没有退出码；
+- `corrupt`：目录存在但 `meta.json` 缺失或无效。
 
 远端布局：
 
@@ -368,7 +368,8 @@ sudo 示例（需要 profile 或连接上保存了 `sudo_password`）：
 - 环境变量直接写在命令里：`export FOO=bar && python train.py`；
 - 任务结束后用 `ssh_remove` 删除 `job_dir` 做清理；
 - 只支持 POSIX 远端；
-- job 的生命周期独立于工具调用和 SSH 连接；取消 `ssh_exec` 或断开连接不会停止 job。检测用 `ssh_job_status`，停止用 `ssh_job_stop`，不需要额外的 `job_kill`；
+- `ssh_job_start` 以 SSH 登录用户运行，没有 `sudo` / `as_user` 参数，也不会使用连接上保存的 sudo 密码；需要特权时使用 NOPASSWD 或 `ssh_exec`；
+- 在支持 `setsid` 的远端（大多数 Linux/BSD），job 的生命周期独立于工具调用和 SSH 连接；没有 `setsid`（例如基础 macOS）时只能尽力 detach，断开连接可能终止进程。取消 `ssh_exec` 不会停止 job；检测用 `ssh_job_status`，停止用 `ssh_job_stop`，不需要额外的 `job_kill`；
 - **只跟踪宿主机进程**：容器有独立生命周期。`docker run -d` 会立刻返回，`docker exec` 不随 job 停止，停止 job 也可能留下容器；是否继续或停止容器需另外决定（`docker ps` / `docker stop`）。
 
 ### 2.11 sudo 密码的已知限制

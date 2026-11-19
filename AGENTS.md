@@ -85,12 +85,13 @@ Use the job tools when a task should outlive one tool call (training, builds, mi
 - `ssh_job_start` returns `job_id`, `pid`, `job_dir`, and the log path. It returns immediately; it does not wait for the command.
 - The job wraps a **foreground** command, including scripts that start parallel children and wait for them (`&` + `wait`). Only commands that return immediately and leave detached work behind (`nohup cmd &`, `docker run -d`) finish the job early and track only the launcher; use `ssh_exec` with stdin/stdout/stderr redirected and detached for those.
 - Do **not** raise `ssh_exec`'s `timeout_ms` to hours. That holds a channel open and loses the result on disconnect.
-- `ssh_job_status` with `job_id` shows state, exit code, elapsed time; add `log_lines` to tail output. Call it without `job_id` to list all jobs.
-- States: `starting`, `running`, `finished`, `stopped`, `lost` (process gone, no exit code), `corrupt`.
-- `ssh_job_stop` sends SIGTERM, then SIGKILL to the process group. It refuses when the pid no longer belongs to the job. There is no separate `job_kill`; cancelling a tool call or disconnecting does not stop a job.
+- `ssh_job_status` with `job_id` shows state, exit code, elapsed time; add `log_lines` to tail output. Call it without `job_id` to list the 100 most recent jobs.
+- States: `starting`, `running`, `finished`, `stopped`, `lost` (process gone or the pid no longer belongs to the job), `corrupt` (missing or invalid `meta.json`).
+- `ssh_job_stop` sends SIGTERM, then SIGKILL to the process group. It refuses when the pid no longer belongs to the job. There is no separate `job_kill`; cancelling a tool call does not stop a job, and with setsid disconnecting does not either.
+- `ssh_job_start` runs as the SSH login user. It has no `sudo` / `as_user` option and does not use the connection's stored sudo password; use NOPASSWD or `ssh_exec` for privileged work.
 - Clean up finished jobs with `ssh_remove` on `job_dir` (use `dry_run` first).
 - Environment variables go inline: `export FOO=bar && python train.py`.
-- Jobs survive disconnect and reconnect; state lives under `~/.opencode-ssh/jobs/` on the remote.
+- Jobs survive disconnect and reconnect when the remote has `setsid` (most Linux/BSD); without `setsid` (for example base macOS) detachment is best-effort. State lives under `~/.opencode-ssh/jobs/` on the remote.
 - Only the **host process** is tracked. Containers keep their own lifecycle: stopping a job may leave the container running, so decide separately whether to stop or keep it (`docker ps`, `docker stop`).
 - POSIX remotes only.
 
