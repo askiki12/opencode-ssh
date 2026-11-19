@@ -39,6 +39,7 @@ import { SshOperationError } from "../src/ssh/errors.js";
 import {
   ConnectionManager,
   describeConnectError,
+  normalizeHomeDir,
   type ExecResult,
 } from "../src/ssh/manager.js";
 import { globToRegExp, SearchService } from "../src/ssh/search.js";
@@ -262,6 +263,102 @@ async function main() {
     relativeConfig.dataDir,
     path.resolve(dataDir, "relative-data"),
   );
+
+  assert.equal(normalizeHomeDir("/home/tester\n"), "/home/tester");
+  assert.throws(() => normalizeHomeDir("not-absolute"), /absolute/);
+  assert.throws(() => normalizeHomeDir("/home/tester\nextra"), /absolute/);
+
+  // SFTP is preferred and must short-circuit the exec fallback.
+  const sftpHomeConnection = { homeDir: undefined as string | undefined };
+  const sftpHomeThis = {
+    connections: new Map([["ssh_test", sftpHomeConnection]]),
+    sftp: async () => ({
+      realpath: (
+        _target: string,
+        callback: (error: Error | undefined, path: string) => void,
+      ) => callback(undefined, "/home/sftp"),
+    }),
+    exec: async () => {
+      throw new Error("exec must not be called when SFTP succeeds");
+    },
+  };
+  assert.equal(
+    await ConnectionManager.prototype.homeDir.call(
+      sftpHomeThis as unknown as ConnectionManager,
+      "ssh_test",
+    ),
+    "/home/sftp",
+  );
+  assert.equal(sftpHomeConnection.homeDir, "/home/sftp");
+
+  // SFTP failure falls back to exec when the command succeeds.
+  const fallbackHomeConnection = { homeDir: undefined as string | undefined };
+  const fallbackExecCalls: string[] = [];
+  const fallbackHomeThis = {
+    connections: new Map([["ssh_test", fallbackHomeConnection]]),
+    sftp: async () => {
+      throw new Error("sftp unavailable");
+    },
+    exec: async (input: { command: string }) => {
+      fallbackExecCalls.push(input.command);
+      return fakeExecResult("/home/tester\n");
+    },
+  };
+  assert.equal(
+    await ConnectionManager.prototype.homeDir.call(
+      fallbackHomeThis as unknown as ConnectionManager,
+      "ssh_test",
+    ),
+    "/home/tester",
+  );
+  assert.equal(fallbackHomeConnection.homeDir, "/home/tester");
+  assert.equal(fallbackExecCalls.length, 1);
+  assert.match(fallbackExecCalls[0] ?? "", /HOME/);
+
+  // A non-zero exec exit code must not be accepted as a home directory.
+  const failedHomeConnection = { homeDir: undefined as string | undefined };
+  const failedHomeThis = {
+    connections: new Map([["ssh_test", failedHomeConnection]]),
+    sftp: async () => {
+      throw new Error("sftp unavailable");
+    },
+    exec: async () => ({
+      ...fakeExecResult("\n", 1),
+      stderr: "shell failed\n",
+    }),
+  };
+  await assert.rejects(
+    () =>
+      ConnectionManager.prototype.homeDir.call(
+        failedHomeThis as unknown as ConnectionManager,
+        "ssh_test",
+      ),
+    (error: unknown) =>
+      error instanceof Error &&
+      /exec exited with code 1/.test(error.message) &&
+      /sftp unavailable/.test(error.message),
+  );
+  assert.equal(failedHomeConnection.homeDir, undefined);
+
+  // Exit 0 with a non-absolute value is still rejected.
+  const invalidHomeConnection = { homeDir: undefined as string | undefined };
+  const invalidHomeThis = {
+    connections: new Map([["ssh_test", invalidHomeConnection]]),
+    sftp: async () => {
+      throw new Error("sftp unavailable");
+    },
+    exec: async () => fakeExecResult("relative/home\n"),
+  };
+  await assert.rejects(
+    () =>
+      ConnectionManager.prototype.homeDir.call(
+        invalidHomeThis as unknown as ConnectionManager,
+        "ssh_test",
+      ),
+    (error: unknown) =>
+      error instanceof Error && /absolute home directory/.test(error.message),
+  );
+  assert.equal(invalidHomeConnection.homeDir, undefined);
 
   const fileRoot = mkdtempSync(path.join(tmpdir(), "opencode-ssh-files-"));
   try {

@@ -30,6 +30,9 @@ import { SshOperationError } from "./errors.js";
 
 const { Client } = ssh2;
 
+const HOME_DIRECTORY_COMMAND =
+  'if [ -n "${HOME:-}" ]; then printf "%s\\n" "$HOME"; else cd && pwd; fi';
+
 export interface ConnectProgress {
   phase: "resolving" | "reading-key" | "handshake" | "ready";
   message: string;
@@ -461,7 +464,12 @@ export class ConnectionManager {
     return wrapper;
   }
 
-  /** Resolve and cache the remote user's home directory via SFTP. */
+  /**
+   * Resolve and cache the remote user's home directory. SFTP realpath is
+   * preferred because it is authoritative under chroot; if the SFTP subsystem
+   * is unavailable, fall back to the login shell so exec-only servers can still
+   * resolve `~` and default search paths.
+   */
   async homeDir(sshId: string): Promise<string> {
     const connection = this.connections.get(sshId);
     if (!connection) {
@@ -469,16 +477,50 @@ export class ConnectionManager {
     }
     if (connection.homeDir) return connection.homeDir;
 
-    const sftp = await this.sftp(sshId);
-    const home = await new Promise<string>((resolve, reject) => {
-      sftp.realpath(".", (error, absolutePath) => {
-        if (error) {
-          reject(asError(error));
-          return;
-        }
-        resolve(absolutePath);
+    let sftpError: unknown;
+    try {
+      const sftp = await this.sftp(sshId);
+      const home = await new Promise<string>((resolve, reject) => {
+        sftp.realpath(".", (error, absolutePath) => {
+          if (error) {
+            reject(asError(error));
+            return;
+          }
+          resolve(absolutePath);
+        });
       });
-    });
+      connection.homeDir = home;
+      return home;
+    } catch (error) {
+      sftpError = error;
+    }
+
+    let result: ExecResult;
+    try {
+      result = await this.exec({
+        sshId,
+        command: HOME_DIRECTORY_COMMAND,
+        timeoutMs: 15_000,
+        maxOutputBytes: 4_096,
+      });
+    } catch (error) {
+      throw homeDirError(sftpError, `exec: ${errorMessage(error)}`);
+    }
+    if (result.exitCode !== 0) {
+      const detail =
+        result.stderr.trim() || result.stdout.trim() || "no output";
+      throw homeDirError(
+        sftpError,
+        `exec exited with code ${result.exitCode === null ? "unknown" : result.exitCode}: ${detail}`,
+      );
+    }
+
+    let home: string;
+    try {
+      home = normalizeHomeDir(result.stdout);
+    } catch (error) {
+      throw homeDirError(sftpError, `exec: ${errorMessage(error)}`);
+    }
     connection.homeDir = home;
     return home;
   }
@@ -989,6 +1031,24 @@ export class ConnectionManager {
     }
     return target;
   }
+}
+
+function homeDirError(sftpError: unknown, execDetail: string): Error {
+  return new Error(
+    "Unable to resolve the remote home directory. " +
+      `SFTP: ${errorMessage(sftpError)}; ${execDetail}`,
+  );
+}
+
+/** Validate and normalize output from the exec-based home directory lookup. */
+export function normalizeHomeDir(stdout: string): string {
+  const value = stdout.trim();
+  if (!value.startsWith("/") || /[\r\n]/.test(value)) {
+    throw new Error(
+      `Remote shell did not report a single absolute home directory: ${JSON.stringify(value)}`,
+    );
+  }
+  return value;
 }
 
 export function describeConnectError(
