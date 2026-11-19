@@ -20,8 +20,13 @@ import type {
   ExecResult,
 } from "../ssh/manager.js";
 import { SshOperationError } from "../ssh/errors.js";
+import { InvalidGlobPatternError } from "../ssh/glob.js";
 import type { JobInfo, JobService } from "../ssh/jobs.js";
-import type { SearchService } from "../ssh/search.js";
+import type {
+  GlobResult,
+  GrepResult,
+  SearchService,
+} from "../ssh/search.js";
 import { errorMessage } from "../util.js";
 
 export interface ExecuteContext {
@@ -306,12 +311,12 @@ const GLOB_INPUT = {
     pattern: {
       type: "string",
       description:
-        "Glob pattern relative to path, for example **/*.ts or src/**/*.{js,jsx}.",
+        "Glob pattern relative to path. *.ts matches only the root level; use **/*.ts for recursion. Supports *, **, ?, [...], {a,b}, and backslash escapes.",
     },
     path: {
       type: "string",
       description:
-        "Directory to search; absolute or ~/..., defaults to the remote home directory.",
+        "Directory to search; absolute or ~/..., defaults to the remote home directory. Relative paths are rejected.",
     },
     max_results: {
       type: "integer",
@@ -321,7 +326,13 @@ const GLOB_INPUT = {
     },
     include_hidden: {
       type: "boolean",
-      description: "Include dotfiles and hidden directories. Default false.",
+      description:
+        "Include hidden entries below the search root. Default false. .git and node_modules stay excluded; an explicit path that is itself hidden or named .git/node_modules is searched.",
+    },
+    include_ignored: {
+      type: "boolean",
+      description:
+        "Include files excluded by .gitignore/.ignore (ripgrep only). Default false. find/SFTP fallbacks cannot read ignore files and warn that results may include them; true only suppresses the warning.",
     },
   },
   required: ["ssh_id", "pattern"],
@@ -337,16 +348,18 @@ const GREP_INPUT = {
     },
     pattern: {
       type: "string",
-      description: "Regular expression unless literal is true.",
+      description:
+        "Regular expression unless literal is true. ripgrep uses Rust regex; grep uses POSIX extended regex. Use literal=true for literal text.",
     },
     path: {
       type: "string",
       description:
-        "File or directory to search; absolute or ~/..., defaults to the remote home directory.",
+        "File or directory to search; absolute or ~/..., defaults to the remote home directory. Relative paths are rejected.",
     },
     include: {
       type: "string",
-      description: "Only search files matching this glob, for example **/*.ts.",
+      description:
+        "Only return matches whose file name matches this glob, for example *.ts. Matches names only; use path to scope directories.",
     },
     literal: {
       type: "boolean",
@@ -359,7 +372,12 @@ const GREP_INPUT = {
     include_hidden: {
       type: "boolean",
       description:
-        "Include hidden files and directories. Defaults to false; .git and node_modules are always excluded.",
+        "Include hidden entries below the search root. Default false. .git and node_modules stay excluded; an explicit path that is itself hidden or named .git/node_modules is searched.",
+    },
+    include_ignored: {
+      type: "boolean",
+      description:
+        "Include files excluded by .gitignore/.ignore (ripgrep only). Default false. The grep fallback cannot read ignore files and warns that results may include them; true only suppresses the warning.",
     },
     max_matches: {
       type: "integer",
@@ -1033,46 +1051,79 @@ export function createSshTools(
     {
       name: "glob",
       description:
-        "Find remote files by glob pattern relative to a directory. " +
-        "Chooses one engine: ripgrep when available, otherwise find, otherwise an SFTP walk. " +
-        "A legitimate zero result is returned as-is; it does not fall back to another scan. " +
-        "Errors and output truncation are reported instead of being hidden as empty results. " +
-        "Default skips .git, node_modules, and hidden entries. " +
-        "Prefer this over shelling out to find/glob through ssh_exec.",
+        "Find remote files matching a glob pattern under path (defaults to the remote home). Returns absolute paths for regular files. " +
+        "Skips hidden entries, .git, and node_modules below the root; with ripgrep also respects .gitignore/.ignore (include_hidden/include_ignored opt in). " +
+        "Chooses one engine and does not rescan on zero results; warnings/incomplete indicate errors or truncation. " +
+        "Prefer this over find via ssh_exec.",
       input: GLOB_INPUT,
       options: { namespace: "ssh", codemode: true },
       execute: async (raw, context) => {
         const input = asRecord(raw);
         const sshId = requireString(input.ssh_id, "ssh_id");
+        const pattern = requireString(input.pattern, "pattern");
         const root =
           input.path === undefined
             ? await dependencies.manager.homeDir(sshId)
             : await resolveTargetPath(dependencies.manager, sshId, input.path);
-        const result = await dependencies.search.glob(
-          sshId,
-          {
-            pattern: requireString(input.pattern, "pattern"),
-            path: root,
-            ...(input.max_results !== undefined
-              ? { maxResults: requireInteger(input.max_results, "max_results") }
-              : {}),
-            ...(input.include_hidden !== undefined
-              ? {
-                  includeHidden: requireBoolean(
-                    input.include_hidden,
-                    "include_hidden",
-                  ),
-                }
-              : {}),
-          },
-          context.signal,
-        );
+
+        let result: GlobResult;
+        try {
+          result = await dependencies.search.glob(
+            sshId,
+            {
+              pattern,
+              path: root,
+              ...(input.max_results !== undefined
+                ? {
+                    maxResults: requireInteger(
+                      input.max_results,
+                      "max_results",
+                    ),
+                  }
+                : {}),
+              ...(input.include_hidden !== undefined
+                ? {
+                    includeHidden: requireBoolean(
+                      input.include_hidden,
+                      "include_hidden",
+                    ),
+                  }
+                : {}),
+              ...(input.include_ignored !== undefined
+                ? {
+                    includeIgnored: requireBoolean(
+                      input.include_ignored,
+                      "include_ignored",
+                    ),
+                  }
+                : {}),
+            },
+            context.signal,
+          );
+        } catch (error) {
+          if (error instanceof InvalidGlobPatternError) {
+            toToolError(
+              new SshOperationError(error.message, {
+                code: "SSH_INVALID_INPUT",
+                retryable: false,
+                hint: "Fix the glob pattern and retry. Use **/*.ts for recursion.",
+                executionMayHaveStarted: false,
+              }),
+              "SSH_INVALID_INPUT",
+            );
+          }
+          toToolError(error);
+        }
 
         const lines = [
           `engine: ${result.engine}`,
           `root: ${root}`,
           `count: ${result.paths.length}`,
           `truncated: ${result.truncated ? "yes" : "no"}`,
+          `incomplete: ${result.incomplete ? "yes" : "no"}`,
+          ...(result.warnings.length > 0
+            ? ["", ...result.warnings.map((warning) => `[warning] ${warning}`)]
+            : []),
           "",
           ...(result.paths.length > 0 ? result.paths : ["(no matches)"]),
         ];
@@ -1080,9 +1131,12 @@ export function createSshTools(
           content: lines.join("\n"),
           metadata: {
             engine: result.engine,
+            pattern,
             root,
             count: result.paths.length,
             truncated: result.truncated,
+            incomplete: result.incomplete,
+            warnings: result.warnings,
           },
         };
       },
@@ -1091,70 +1145,113 @@ export function createSshTools(
     {
       name: "grep",
       description:
-        "Search remote file contents. Chooses one engine: ripgrep when available, otherwise grep; " +
-        "there is no line-by-line SFTP fallback because it is far slower. " +
-        "A legitimate zero match is returned as-is; it does not fall back to another scan. " +
-        "Errors and output truncation are reported instead of being hidden as empty results. " +
-        "If the remote lacks both tools, suggest installing ripgrep via ssh_exec and ask the user first. " +
-        "Skips hidden entries, .git, and node_modules by default (set include_hidden=true to opt in); returns path, line number, and matching text up to max_matches.",
+        "Search remote file contents and return path:line:text. Chooses ripgrep or grep and does not rescan on zero matches. " +
+        "Skips hidden entries, .git, and node_modules below the root; with ripgrep also respects .gitignore/.ignore (include_hidden/include_ignored opt in). " +
+        "include filters file names, not directories. Invalid patterns are input errors; warnings/incomplete mean results may be partial. " +
+        "Prefer this over grep via ssh_exec.",
       input: GREP_INPUT,
       options: { namespace: "ssh", codemode: true },
       execute: async (raw, context) => {
         const input = asRecord(raw);
         const sshId = requireString(input.ssh_id, "ssh_id");
+        const pattern = requireString(input.pattern, "pattern");
+        const include =
+          input.include === undefined
+            ? undefined
+            : requireString(input.include, "include");
         const target =
           input.path === undefined
             ? await dependencies.manager.homeDir(sshId)
             : await resolveTargetPath(dependencies.manager, sshId, input.path);
-        const result = await dependencies.search.grep(
-          sshId,
-          {
-            pattern: requireString(input.pattern, "pattern"),
-            path: target,
-            ...(input.include !== undefined
-              ? { include: requireString(input.include, "include") }
-              : {}),
-            ...(input.literal !== undefined
-              ? { literal: requireBoolean(input.literal, "literal") }
-              : {}),
-            ...(input.case_sensitive !== undefined
-              ? {
-                  caseSensitive: requireBoolean(
-                    input.case_sensitive,
-                    "case_sensitive",
-                  ),
-                }
-              : {}),
-            ...(input.include_hidden !== undefined
-              ? {
-                  includeHidden: requireBoolean(
-                    input.include_hidden,
-                    "include_hidden",
-                  ),
-                }
-              : {}),
-            ...(input.max_matches !== undefined
-              ? { maxMatches: requireInteger(input.max_matches, "max_matches") }
-              : {}),
-          },
-          context.signal,
-        );
+
+        let result: GrepResult;
+        try {
+          result = await dependencies.search.grep(
+            sshId,
+            {
+              pattern,
+              path: target,
+              ...(include !== undefined ? { include } : {}),
+              ...(input.literal !== undefined
+                ? { literal: requireBoolean(input.literal, "literal") }
+                : {}),
+              ...(input.case_sensitive !== undefined
+                ? {
+                    caseSensitive: requireBoolean(
+                      input.case_sensitive,
+                      "case_sensitive",
+                    ),
+                  }
+                : {}),
+              ...(input.include_hidden !== undefined
+                ? {
+                    includeHidden: requireBoolean(
+                      input.include_hidden,
+                      "include_hidden",
+                    ),
+                  }
+                : {}),
+              ...(input.include_ignored !== undefined
+                ? {
+                    includeIgnored: requireBoolean(
+                      input.include_ignored,
+                      "include_ignored",
+                    ),
+                  }
+                : {}),
+              ...(input.max_matches !== undefined
+                ? {
+                    maxMatches: requireInteger(
+                      input.max_matches,
+                      "max_matches",
+                    ),
+                  }
+                : {}),
+            },
+            context.signal,
+          );
+        } catch (error) {
+          if (error instanceof InvalidGlobPatternError) {
+            toToolError(
+              new SshOperationError(error.message, {
+                code: "SSH_INVALID_INPUT",
+                retryable: false,
+                hint: "Fix the include glob and retry. It matches file names only, for example *.ts.",
+                executionMayHaveStarted: false,
+              }),
+              "SSH_INVALID_INPUT",
+            );
+          }
+          toToolError(error);
+        }
 
         const lines = [
           `engine: ${result.engine}`,
+          `path: ${target}`,
           `count: ${result.matches.length}`,
           `truncated: ${result.truncated ? "yes" : "no"}`,
+          `incomplete: ${result.incomplete ? "yes" : "no"}`,
+          ...(result.warnings.length > 0
+            ? ["", ...result.warnings.map((warning) => `[warning] ${warning}`)]
+            : []),
           "",
           ...(result.matches.length > 0
-            ? result.matches.map((match) => `${match.path}:${match.line}: ${match.text}`)
+            ? result.matches.map(
+                (match) => `${match.path}:${match.line}: ${match.text}`,
+              )
             : ["(no matches)"]),
         ];
         return {
           content: lines.join("\n"),
           metadata: {
             engine: result.engine,
+            pattern,
+            path: target,
+            ...(include !== undefined ? { include } : {}),
             count: result.matches.length,
             truncated: result.truncated,
+            incomplete: result.incomplete,
+            warnings: result.warnings,
           },
         };
       },

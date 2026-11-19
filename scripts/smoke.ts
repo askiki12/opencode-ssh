@@ -44,7 +44,7 @@ import {
   type ExecResult,
 } from "../src/ssh/manager.js";
 import { compileGlob, InvalidGlobPatternError } from "../src/ssh/glob.js";
-import { globToRegExp, SearchService } from "../src/ssh/search.js";
+import { SearchService } from "../src/ssh/search.js";
 import { createSshTools, type ToolDefinition } from "../src/tools/definitions.js";
 import { OutputCollector } from "../src/util.js";
 import { createFakeSftp } from "./fake-sftp.js";
@@ -460,12 +460,17 @@ async function main() {
       fakeExecResult("rg=1\ngrep=1\nfind=1\n"),
       fakeExecResult("", 2),
     ]);
-    await assert.rejects(
-      new SearchService(failedGlob.manager).glob("ssh_test", {
-        pattern: "**/*.ts",
-        path: "/work",
-      }),
-      /rg failed/,
+    const failedGlobResult = await new SearchService(
+      failedGlob.manager,
+    ).glob("ssh_test", {
+      pattern: "**/*.ts",
+      path: "/work",
+    });
+    assert.deepEqual(failedGlobResult.paths, []);
+    assert.equal(failedGlobResult.incomplete, true);
+    assert.match(
+      failedGlobResult.warnings.join("\n"),
+      /exited with code 2/,
     );
     assert.equal(failedGlob.calls.length, 2);
 
@@ -535,13 +540,176 @@ async function main() {
       fakeExecResult("rg=0\ngrep=1\nfind=1\n"),
       fakeExecResult("", 1),
     ]);
-    await assert.rejects(
-      new SearchService(failedFind.manager).glob("ssh_test", {
-        pattern: "**/*.ts",
-        path: "/work",
-      }),
-      /find failed/,
+    const failedFindResult = await new SearchService(
+      failedFind.manager,
+    ).glob("ssh_test", {
+      pattern: "**/*.ts",
+      path: "/work",
+    });
+    assert.deepEqual(failedFindResult.paths, []);
+    assert.equal(failedFindResult.incomplete, true);
+    assert.match(failedFindResult.warnings.join("\n"), /exited with code 1/);
+    assert.match(
+      failedFindResult.warnings.join("\n"),
+      /cannot read \.gitignore/,
     );
+
+    const includeGrep = fakeSearchManager([
+      fakeExecResult("rg=1\ngrep=1\nfind=1\n"),
+      fakeExecResult(
+        [
+          JSON.stringify({
+            type: "match",
+            data: {
+              path: { text: "/work/a.ts" },
+              lines: { text: "needle\n" },
+              line_number: 1,
+            },
+          }),
+          JSON.stringify({
+            type: "match",
+            data: {
+              path: { text: "/work/b.md" },
+              lines: { text: "needle\n" },
+              line_number: 2,
+            },
+          }),
+        ].join("\n") + "\n",
+      ),
+    ]);
+    const includeGrepResult = await new SearchService(
+      includeGrep.manager,
+    ).grep("ssh_test", {
+      pattern: "needle",
+      path: "/work",
+      include: "*.ts",
+    });
+    assert.deepEqual(
+      includeGrepResult.matches.map((match) => match.path),
+      ["/work/a.ts"],
+    );
+    assert.doesNotMatch(includeGrep.calls[1] ?? "", /\*\.ts/);
+
+    const fallbackInclude = fakeSearchManager([
+      fakeExecResult("rg=0\ngrep=1\nfind=0\ngrep_extended=1\n"),
+      fakeExecResult("/work/a.ts:1:needle\n/work/b.md:2:needle\n"),
+    ]);
+    const fallbackIncludeResult = await new SearchService(
+      fallbackInclude.manager,
+    ).grep("ssh_test", {
+      pattern: "needle",
+      path: "/work",
+      include: "*.ts",
+    });
+    assert.deepEqual(
+      fallbackIncludeResult.matches.map((match) => match.path),
+      ["/work/a.ts"],
+    );
+    assert.doesNotMatch(fallbackInclude.calls[1] ?? "", /--include/);
+    assert.match(fallbackInclude.calls[1] ?? "", /-E/);
+
+    await assert.rejects(
+      () =>
+        new SearchService(fakeSearchManager([]).manager).grep("ssh_test", {
+          pattern: "needle",
+          path: "/work",
+          include: "src/*.ts",
+        }),
+      (error: unknown) => error instanceof InvalidGlobPatternError,
+    );
+
+    const portableGrep = fakeSearchManager([
+      fakeExecResult("rg=0\ngrep=1\nfind=0\ngrep_extended=0\n"),
+      fakeExecResult(
+        [
+          "/work/.hidden.ts:1:needle",
+          "/work/node_modules/a.ts:1:needle",
+          "/work/.cache/b.ts:1:needle",
+          "/work/src/a.ts:1:needle",
+        ].join("\n") + "\n",
+      ),
+    ]);
+    const portableGrepResult = await new SearchService(
+      portableGrep.manager,
+    ).grep("ssh_test", { pattern: "needle", path: "/work" });
+    assert.deepEqual(
+      portableGrepResult.matches.map((match) => match.path),
+      ["/work/src/a.ts"],
+    );
+    assert.doesNotMatch(portableGrep.calls[1] ?? "", /--exclude-dir/);
+    assert.match(
+      portableGrepResult.warnings.join("\n"),
+      /does not support --exclude-dir/,
+    );
+
+    const hiddenRootGrep = fakeSearchManager([
+      fakeExecResult("rg=0\ngrep=1\nfind=0\ngrep_extended=1\n"),
+      fakeExecResult("/work/.config/a.ts:1:needle\n"),
+    ]);
+    const hiddenRootGrepResult = await new SearchService(
+      hiddenRootGrep.manager,
+    ).grep("ssh_test", { pattern: "needle", path: "/work/.config" });
+    assert.deepEqual(
+      hiddenRootGrepResult.matches.map((match) => match.path),
+      ["/work/.config/a.ts"],
+    );
+    assert.doesNotMatch(hiddenRootGrep.calls[1] ?? "", /--exclude-dir=\.\*/);
+
+    const invalidRegex = fakeSearchManager([
+      fakeExecResult("rg=1\ngrep=1\nfind=1\n"),
+      {
+        ...fakeExecResult("", 2),
+        stderr: "regex parse error:\n    (\n    ^\nerror: unclosed group",
+      },
+    ]);
+    await assert.rejects(
+      () =>
+        new SearchService(invalidRegex.manager).grep("ssh_test", {
+          pattern: "(",
+          path: "/work",
+        }),
+      (error: unknown) =>
+        error instanceof SshOperationError &&
+        error.code === "SSH_INVALID_INPUT",
+    );
+
+    const noGrepTool = fakeSearchManager([
+      fakeExecResult("rg=0\ngrep=0\nfind=1\n"),
+    ]);
+    await assert.rejects(
+      () =>
+        new SearchService(noGrepTool.manager).grep("ssh_test", {
+          pattern: "needle",
+          path: "/work",
+        }),
+      (error: unknown) =>
+        error instanceof SshOperationError &&
+        error.code === "SSH_INTERNAL_ERROR" &&
+        error.recommendedNextTool === "ssh_exec",
+    );
+
+    // Exactly maxResults matches followed by non-matching entries must not
+    // report truncation.
+    const sftpGlobDir = path.join(fileRoot, "sftp-trunc");
+    mkdirSync(sftpGlobDir, { recursive: true });
+    writeFileSync(path.join(sftpGlobDir, "a.ts"), "");
+    writeFileSync(path.join(sftpGlobDir, "b.md"), "");
+    writeFileSync(path.join(sftpGlobDir, "c.md"), "");
+    const sftpSearch = {
+      exec: async () => fakeExecResult("rg=0\ngrep=0\nfind=0\n"),
+      sftp: async () => createFakeSftp(fileRoot),
+    };
+    const sftpGlobResult = await new SearchService(
+      sftpSearch as unknown as ConnectionManager,
+    ).glob("ssh_test", {
+      pattern: "**/*.ts",
+      path: "/sftp-trunc",
+      maxResults: 1,
+    });
+    assert.equal(sftpGlobResult.engine, "sftp");
+    assert.deepEqual(sftpGlobResult.paths, ["/sftp-trunc/a.ts"]);
+    assert.equal(sftpGlobResult.truncated, false);
+    assert.equal(sftpGlobResult.incomplete, false);
 
     const created = await writeRemoteFile(
       sftp,
@@ -1384,6 +1552,8 @@ async function main() {
             engine: "rg" as const,
             paths: [`${options.path}/a.ts`],
             truncated: false,
+            incomplete: false,
+            warnings: [],
           }),
         } as unknown as SearchService,
         jobs: {} as JobService,
@@ -1402,6 +1572,42 @@ async function main() {
         ),
       /absolute/,
     );
+
+    const invalidTools = new Map(
+      createSshTools({
+        manager: {} as ConnectionManager,
+        profiles,
+        config,
+        search: new SearchService({} as ConnectionManager),
+        jobs: {} as JobService,
+      }).map((tool) => [tool.name, tool]),
+    );
+    const invalidGlobToolError = await requiredTool(invalidTools, "glob")
+      .execute(
+        { ssh_id: "ssh_test", pattern: "[!z-a].ts", path: "/work" },
+        context,
+      )
+      .catch((error: unknown) => error);
+    if (!(invalidGlobToolError instanceof ToolError)) {
+      throw new Error("expected a ToolError for an invalid glob pattern");
+    }
+    assert.equal(invalidGlobToolError.metadata?.errorCode, "SSH_INVALID_INPUT");
+
+    const invalidGrepToolError = await requiredTool(invalidTools, "grep")
+      .execute(
+        {
+          ssh_id: "ssh_test",
+          pattern: "needle",
+          path: "/work",
+          include: "src/*.ts",
+        },
+        context,
+      )
+      .catch((error: unknown) => error);
+    if (!(invalidGrepToolError instanceof ToolError)) {
+      throw new Error("expected a ToolError for an invalid include glob");
+    }
+    assert.equal(invalidGrepToolError.metadata?.errorCode, "SSH_INVALID_INPUT");
 
     const connectResult = await requiredTool(byName, "connect").execute(
       {

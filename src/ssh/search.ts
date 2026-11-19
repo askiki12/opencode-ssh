@@ -1,5 +1,9 @@
 import path from "node:path";
+import { InvalidGlobPatternError, compileGlob } from "./glob.js";
+import type { GlobMatcher } from "./glob.js";
 import { shellQuote } from "./command.js";
+import { SshOperationError } from "./errors.js";
+import { errorMessage } from "../util.js";
 import type { ConnectionManager, ExecResult } from "./manager.js";
 import type { SftpLike } from "./files.js";
 
@@ -12,15 +16,24 @@ export interface RemoteTools {
   rg: boolean;
   grep: boolean;
   find: boolean;
+  /**
+   * True when grep accepts the GNU/BSD long options we use for exclusions
+   * (notably --exclude-dir). BusyBox grep does not, so the fallback has to
+   * filter results after the search instead.
+   */
+  grepExtended: boolean;
 }
 
 export interface GrepOptions {
   pattern: string;
   path: string;
+  /** Basename glob, for example *.ts. Use path to scope directories. */
   include?: string;
   literal?: boolean;
   caseSensitive?: boolean;
   includeHidden?: boolean;
+  /** Include files normally excluded by .gitignore (ripgrep only). */
+  includeIgnored?: boolean;
   maxMatches?: number;
 }
 
@@ -34,6 +47,9 @@ export interface GrepResult {
   engine: "rg" | "grep";
   matches: GrepMatch[];
   truncated: boolean;
+  /** True when the search may be missing results (errors or truncation). */
+  incomplete: boolean;
+  warnings: string[];
 }
 
 export interface GlobOptions {
@@ -41,12 +57,17 @@ export interface GlobOptions {
   path: string;
   maxResults?: number;
   includeHidden?: boolean;
+  /** Include files normally excluded by .gitignore (ripgrep only). */
+  includeIgnored?: boolean;
 }
 
 export interface GlobResult {
   engine: "rg" | "find" | "sftp";
   paths: string[];
   truncated: boolean;
+  /** True when the search may be missing results (errors or truncation). */
+  incomplete: boolean;
+  warnings: string[];
 }
 
 /**
@@ -68,7 +89,8 @@ export class SearchService {
         {
           sshId,
           command:
-            "for tool in rg grep find; do if command -v \"$tool\" >/dev/null 2>&1; then echo \"$tool=1\"; else echo \"$tool=0\"; fi; done",
+            "for tool in rg grep find; do if command -v \"$tool\" >/dev/null 2>&1; then echo \"$tool=1\"; else echo \"$tool=0\"; fi; done; " +
+            "if grep --help 2>&1 | grep -q -- '--exclude-dir'; then echo grep_extended=1; else echo grep_extended=0; fi",
           timeoutMs: 15_000,
           maxOutputBytes: 4_096,
         },
@@ -86,18 +108,39 @@ export class SearchService {
     options: GrepOptions,
     signal?: AbortSignal,
   ): Promise<GrepResult> {
-    const tools = await this.tools(sshId, signal);
     const maxMatches = clamp(options.maxMatches ?? 200, 1, 5_000);
+    const include = compileInclude(options.include);
+    const tools = await this.tools(sshId, signal);
     if (tools.rg) {
-      return this.grepWithRipgrep(sshId, options, maxMatches, signal);
+      return this.grepWithRipgrep(
+        sshId,
+        options,
+        include,
+        maxMatches,
+        signal,
+      );
     }
     if (tools.grep) {
-      return this.grepWithGrep(sshId, options, maxMatches, signal);
+      return this.grepWithGrep(
+        sshId,
+        tools.grepExtended,
+        options,
+        include,
+        maxMatches,
+        signal,
+      );
     }
-    throw new Error(
+    throw new SshOperationError(
       "Remote host has neither ripgrep (rg) nor grep. Install ripgrep with the " +
         "remote package manager (for example: apt install ripgrep) or use ssh_exec " +
         "to inspect files directly.",
+      {
+        code: "SSH_INTERNAL_ERROR",
+        retryable: false,
+        hint: "Install ripgrep on the remote host (for example: apt install ripgrep) and ask the user before installing.",
+        recommendedNextTool: "ssh_exec",
+        executionMayHaveStarted: false,
+      },
     );
   }
 
@@ -106,41 +149,40 @@ export class SearchService {
     options: GlobOptions,
     signal?: AbortSignal,
   ): Promise<GlobResult> {
+    const matcher = compileGlob(options.pattern);
     const tools = await this.tools(sshId, signal);
     const maxResults = clamp(options.maxResults ?? 2_000, 1, 5_000);
     // Pick one engine and accept an empty result as success. Falling through
     // on zero matches would scan the tree up to three times.
     if (tools.rg) {
-      return this.rgFiles(sshId, options, maxResults, signal);
+      return this.rgFiles(sshId, options, matcher, maxResults, signal);
     }
     if (tools.find) {
-      return this.findFiles(sshId, options, maxResults, signal);
+      return this.findFiles(sshId, options, matcher, maxResults, signal);
     }
-    return this.sftpFiles(sshId, options, maxResults, signal);
+    return this.sftpFiles(sshId, options, matcher, maxResults, signal);
   }
 
   private async grepWithRipgrep(
     sshId: string,
     options: GrepOptions,
+    include: GlobMatcher | undefined,
     maxMatches: number,
     signal?: AbortSignal,
   ): Promise<GrepResult> {
-    const flags = [
-      "--no-config",
-      "--json",
-      "--no-messages",
-      "--max-filesize",
-      "10M",
-      "--glob",
-      shellQuote("!**/.git/**"),
-      "--glob",
-      shellQuote("!**/node_modules/**"),
-    ];
+    const flags = ["--no-config", "--json"];
     if (options.includeHidden === true) flags.push("--hidden");
+    if (options.includeIgnored === true) flags.push("--no-ignore");
     if (options.literal === true) flags.push("-F");
     if (options.caseSensitive === false) flags.push("-i");
-    if (options.include !== undefined) {
-      flags.push("--glob", shellQuote(options.include));
+    // If the search root itself is .git or node_modules, do not exclude the
+    // whole subtree: the exclusions are meant for descendants of a normal root.
+    const rootName = posix.basename(options.path);
+    if (rootName !== ".git") {
+      flags.push("--glob", shellQuote("!**/.git/**"));
+    }
+    if (rootName !== "node_modules") {
+      flags.push("--glob", shellQuote("!**/node_modules/**"));
     }
 
     const result = await this.run(
@@ -156,26 +198,33 @@ export class SearchService {
       signal,
     );
 
-    if (result.exitCode === 1) {
-      return { engine: "rg", matches: [], truncated: result.truncated };
-    }
-    if (result.exitCode !== 0) {
-      throw new Error(commandFailure("rg", result));
-    }
-
+    const command = commandWarnings("rg", result, 1);
     const matches: GrepMatch[] = [];
     let truncated = false;
+    // Parse even on exit code 2: ripgrep still prints matches it found before
+    // or despite file errors. Discarding them would turn an incomplete search
+    // into a false "no matches".
     for (const line of result.stdout.split(/\r?\n/)) {
       if (line.length === 0) continue;
       const parsed = safeJson(line);
       if (parsed === undefined || parsed.type !== "match") continue;
       const data = parsed.data as Record<string, any> | undefined;
       if (!data) continue;
+      const filePath = textOf(data.path) ?? options.path;
+      if (
+        !keepGrepMatch(
+          filePath,
+          options.path,
+          options.includeHidden,
+          include,
+        )
+      ) {
+        continue;
+      }
       if (matches.length >= maxMatches) {
         truncated = true;
         break;
       }
-      const filePath = textOf(data.path) ?? options.path;
       const text = (textOf(data.lines) ?? "").replace(/\r?\n$/, "");
       matches.push({
         path: filePath,
@@ -183,38 +232,48 @@ export class SearchService {
         text,
       });
     }
+    assertCommandInput("rg", result, matches.length);
 
     return {
       engine: "rg",
       matches,
       truncated: truncated || result.truncated,
+      incomplete: truncated || result.truncated || command.incomplete,
+      warnings: command.warnings,
     };
   }
 
   private async grepWithGrep(
     sshId: string,
+    grepExtended: boolean,
     options: GrepOptions,
+    include: GlobMatcher | undefined,
     maxMatches: number,
     signal?: AbortSignal,
   ): Promise<GrepResult> {
     const flags = [
-      "-rIn",
+      "-r",
+      "-n",
       // Force the filename prefix. grep omits it for a single file operand,
       // which would make the path:line:text output below unparseable.
       "-H",
-      "--color=never",
-      "--exclude-dir=.git",
-      "--exclude-dir=node_modules",
     ];
-    if (options.includeHidden !== true) {
-      flags.push("--exclude-dir=.*", "--exclude=.*");
-    }
-    if (options.literal === true) flags.push("-F");
+    // Prefer ERE so common quantifiers and alternation behave like ripgrep.
+    flags.push(options.literal === true ? "-F" : "-E");
     if (options.caseSensitive === false) flags.push("-i");
-    if (options.include !== undefined) {
-      flags.push("--include", shellQuote(options.include));
+    if (grepExtended) {
+      flags.push("--color=never", "-I");
+      const rootName = posix.basename(options.path);
+      if (rootName !== ".git") flags.push("--exclude-dir=.git");
+      if (rootName !== "node_modules") flags.push("--exclude-dir=node_modules");
+      // Do not prune a hidden explicit root such as ~/.config.
+      if (options.includeHidden !== true && !rootName.startsWith(".")) {
+        flags.push("--exclude-dir=.*");
+      }
     }
 
+    // The path is absolute and the pattern is consumed by -e, so "--" is not
+    // needed and omitting it keeps BusyBox grep happy.
     const result = await this.run(
       sshId,
       [
@@ -222,87 +281,118 @@ export class SearchService {
         ...flags,
         "-e",
         shellQuote(options.pattern),
-        "--",
         shellQuote(options.path),
       ],
       signal,
     );
 
-    if (result.exitCode === 1) {
-      return { engine: "grep", matches: [], truncated: result.truncated };
-    }
-    if (result.exitCode !== 0) {
-      throw new Error(commandFailure("grep", result));
-    }
-
+    const command = commandWarnings("grep", result, 1);
+    const warnings = [
+      ...ignoredEngineWarnings("grep", options.includeIgnored),
+      ...(grepExtended ? [] : [portableGrepWarning()]),
+      ...command.warnings,
+    ];
     const matches: GrepMatch[] = [];
     let truncated = false;
     for (const line of result.stdout.split(/\r?\n/)) {
       if (line.length === 0) continue;
+      // grep has no portable NUL-delimited filename output, so a filename
+      // containing ":<digits>:" is inherently ambiguous here. ripgrep uses
+      // --json and does not have this limitation.
       const parsed = /^(.*?):(\d+):(.*)$/.exec(line);
       if (!parsed) continue;
+      const filePath = parsed[1] ?? "";
+      if (
+        !keepGrepMatch(
+          filePath,
+          options.path,
+          options.includeHidden,
+          include,
+        )
+      ) {
+        continue;
+      }
       if (matches.length >= maxMatches) {
         truncated = true;
         break;
       }
       matches.push({
-        path: parsed[1] ?? "",
+        path: filePath,
         line: Number(parsed[2] ?? 0),
         text: parsed[3] ?? "",
       });
     }
+    assertCommandInput("grep", result, matches.length);
 
     return {
       engine: "grep",
       matches,
       truncated: truncated || result.truncated,
+      incomplete: truncated || result.truncated || command.incomplete,
+      warnings,
     };
   }
 
   private async rgFiles(
     sshId: string,
     options: GlobOptions,
+    matcher: GlobMatcher,
     maxResults: number,
     signal?: AbortSignal,
   ): Promise<GlobResult> {
-    const flags = ["--files", "--glob", shellQuote(options.pattern)];
+    const flags = ["--no-config", "--files"];
     if (options.includeHidden === true) flags.push("--hidden");
-    flags.push("--glob", shellQuote("!**/.git/**"));
-    flags.push("--glob", shellQuote("!**/node_modules/**"));
+    if (options.includeIgnored === true) flags.push("--no-ignore");
+    // Exclude only descendants of a normal root. If the root itself is .git or
+    // node_modules, an exclusion glob would hide the whole explicit subtree.
+    const rootName = posix.basename(options.path);
+    if (rootName !== ".git") {
+      flags.push("--glob", shellQuote("!**/.git/**"));
+    }
+    if (rootName !== "node_modules") {
+      flags.push("--glob", shellQuote("!**/node_modules/**"));
+    }
     flags.push("-0");
 
-    const result = await this.manager.exec(
-      {
-        sshId,
-        command: `rg ${flags.join(" ")}`,
-        cwd: options.path,
-        timeoutMs: SEARCH_TIMEOUT_MS,
-        maxOutputBytes: SEARCH_MAX_BYTES,
-        // -0 output is NUL-separated; terminal sanitization would strip it.
-        rawOutput: true,
-      },
+    // Pass the root as an operand instead of using cwd: a failed `cd` also
+    // exits 1, which is indistinguishable from ripgrep's legitimate "no
+    // files" status and would hide the real error.
+    const result = await this.run(
+      sshId,
+      ["rg", ...flags, "--", shellQuote(options.path)],
       signal,
+      // -0 output is NUL-separated; terminal sanitization would strip it.
+      true,
     );
-    // `rg --files` uses 0 for success. Some builds return 1 for no files;
-    // anything higher is a real error (bad path, permissions, invalid flags).
-    if (result.exitCode !== 0 && result.exitCode !== 1) {
-      throw new Error(commandFailure("rg", result));
-    }
 
-    const paths = splitNulOutput(result.stdout, result.truncated)
-      .filter((entry) => entry.length > 0)
-      .map((entry) => posix.join(options.path, entry))
-      .sort();
+    const command = commandWarnings("rg", result, 1);
+    // Do not pass the pattern as --glob: ripgrep globs override .gitignore,
+    // which would silently change the documented "respect ignore" default.
+    // List files under the normal ignore rules, then filter locally.
+    const paths: string[] = [];
+    for (const entry of splitNulOutput(result.stdout, result.truncated)) {
+      if (entry.length === 0) continue;
+      const absolute = listedPath(options.path, entry);
+      const relative = relativeTo(options.path, absolute);
+      if (isIgnored(relative, options.includeHidden !== true)) continue;
+      if (!matcher(relative)) continue;
+      paths.push(absolute);
+    }
+    paths.sort();
+    const truncated = result.truncated || paths.length > maxResults;
     return {
       engine: "rg",
       paths: paths.slice(0, maxResults),
-      truncated: result.truncated || paths.length > maxResults,
+      truncated,
+      incomplete: truncated || command.incomplete,
+      warnings: command.warnings,
     };
   }
 
   private async findFiles(
     sshId: string,
     options: GlobOptions,
+    matcher: GlobMatcher,
     maxResults: number,
     signal?: AbortSignal,
   ): Promise<GlobResult> {
@@ -337,48 +427,57 @@ export class SearchService {
       // -print0 output is NUL-separated; keep the separators intact.
       true,
     );
-    if (result.exitCode !== 0) {
-      throw new Error(commandFailure("find", result));
-    }
+    const command = commandWarnings("find", result);
+    const warnings = [
+      ...ignoredEngineWarnings("find", options.includeIgnored),
+      ...command.warnings,
+    ];
 
-    const matcher = globToRegExp(options.pattern);
     const paths: string[] = [];
     for (const entry of splitNulOutput(result.stdout, result.truncated)) {
       if (entry.length === 0) continue;
       const relative = relativeTo(options.path, entry);
       if (isIgnored(relative, options.includeHidden !== true)) continue;
-      if (!matcher.test(relative)) continue;
+      if (!matcher(relative)) continue;
       paths.push(entry);
     }
     paths.sort();
 
+    const truncated = result.truncated || paths.length > maxResults;
     return {
       engine: "find",
       paths: paths.slice(0, maxResults),
-      truncated: result.truncated || paths.length > maxResults,
+      truncated,
+      incomplete: truncated || command.incomplete,
+      warnings,
     };
   }
 
   private async sftpFiles(
     sshId: string,
     options: GlobOptions,
+    matcher: GlobMatcher,
     maxResults: number,
     signal?: AbortSignal,
   ): Promise<GlobResult> {
     const sftp = await this.manager.sftp(sshId);
-    const matcher = globToRegExp(options.pattern);
     const paths: string[] = [];
+    const warnings = ignoredEngineWarnings("sftp", options.includeIgnored);
     let truncated = false;
+    let incomplete = false;
 
     const visit = async (directory: string): Promise<void> => {
       if (signal?.aborted) throw new Error("Search aborted.");
-      const entries = await callSftp(sftp, directory);
+      let entries: Awaited<ReturnType<typeof callSftp>>;
+      try {
+        entries = await callSftp(sftp, directory);
+      } catch (error) {
+        warnings.push(`Cannot read ${directory}: ${errorMessage(error)}`);
+        incomplete = true;
+        return;
+      }
       for (const entry of entries) {
         if (signal?.aborted) throw new Error("Search aborted.");
-        if (paths.length >= maxResults) {
-          truncated = true;
-          return;
-        }
         const child = posix.join(directory, entry.filename);
         const relative = relativeTo(options.path, child);
         if (entry.attrs.isDirectory()) {
@@ -388,7 +487,14 @@ export class SearchService {
         }
         if (!entry.attrs.isFile()) continue;
         if (isIgnored(relative, options.includeHidden !== true)) continue;
-        if (!matcher.test(relative)) continue;
+        if (!matcher(relative)) continue;
+        if (paths.length >= maxResults) {
+          // Only a real extra match proves the result was truncated. Checking
+          // the limit before every entry produced false positives when the
+          // remaining entries did not match.
+          truncated = true;
+          return;
+        }
         paths.push(child);
       }
     };
@@ -398,7 +504,9 @@ export class SearchService {
     return {
       engine: "sftp",
       paths: paths.slice(0, maxResults),
-      truncated: truncated || paths.length > maxResults,
+      truncated,
+      incomplete: truncated || incomplete,
+      warnings,
     };
   }
 
@@ -421,123 +529,39 @@ export class SearchService {
   }
 }
 
-export function globToRegExp(pattern: string): RegExp {
-  const sources = expandBraces(pattern).map(globToSource);
-  return new RegExp(`^(?:${sources.join("|")})$`);
-}
-
-function globToSource(pattern: string): string {
-  let source = "";
-  let index = 0;
-  while (index < pattern.length) {
-    const character = pattern[index] ?? "";
-    if (character === "*") {
-      if (pattern[index + 1] === "*") {
-        index += 2;
-        if (pattern[index] === "/") {
-          source += "(?:.*/)?";
-          index += 1;
-        } else {
-          source += ".*";
-        }
-        continue;
-      }
-      source += "[^/]*";
-      index += 1;
-      continue;
-    }
-    if (character === "?") {
-      source += "[^/]";
-      index += 1;
-      continue;
-    }
-    if (character === "[") {
-      const end = pattern.indexOf("]", index + 1);
-      if (end === -1) {
-        source += "\\[";
-        index += 1;
-        continue;
-      }
-      let body = pattern.slice(index + 1, end);
-      if (body.startsWith("!")) body = `^${body.slice(1)}`;
-      source += `[${body.replaceAll("\\", "\\\\")}]`;
-      index = end + 1;
-      continue;
-    }
-    source += escapeRegExp(character);
-    index += 1;
+function compileInclude(pattern: string | undefined): GlobMatcher | undefined {
+  if (pattern === undefined) return undefined;
+  if (pattern.includes("/")) {
+    throw new InvalidGlobPatternError(
+      pattern,
+      `Invalid include glob ${JSON.stringify(pattern)}: include matches file names only; use path to scope directories.`,
+    );
   }
-  return source;
+  return compileGlob(pattern);
 }
 
-function expandBraces(pattern: string): string[] {
-  const open = pattern.indexOf("{");
-  if (open === -1) return [pattern];
-  const close = pattern.indexOf("}", open + 1);
-  if (close === -1) return [pattern];
-
-  const body = pattern.slice(open + 1, close);
-  const options = splitTopLevel(body);
-  if (options.length === 1) return [pattern];
-
-  const prefix = pattern.slice(0, open);
-  const suffix = pattern.slice(close + 1);
-  return options.flatMap((option) => expandBraces(`${prefix}${option}${suffix}`));
+/**
+ * Apply the flags that must not be delegated to the search command. include
+ * is a basename filter so it behaves like grep --include and never changes
+ * ignore rules.
+ */
+function keepGrepMatch(
+  matchPath: string,
+  root: string,
+  includeHidden: boolean | undefined,
+  include: GlobMatcher | undefined,
+): boolean {
+  const relative = relativeTo(root, matchPath);
+  if (isIgnored(relative, includeHidden !== true)) return false;
+  if (include === undefined) return true;
+  return include(posix.basename(matchPath));
 }
 
-function splitTopLevel(body: string): string[] {
-  const parts: string[] = [];
-  let depth = 0;
-  let current = "";
-  for (const character of body) {
-    if (character === "," && depth === 0) {
-      parts.push(current);
-      current = "";
-      continue;
-    }
-    if (character === "{") depth += 1;
-    if (character === "}") depth -= 1;
-    current += character;
-  }
-  parts.push(current);
-  return parts;
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function relativeTo(root: string, target: string): string {
-  const normalizedRoot = posix.normalize(root);
-  const normalizedTarget = posix.normalize(target);
-  if (normalizedTarget === normalizedRoot) return ".";
-  const prefix = normalizedRoot.endsWith("/")
-    ? normalizedRoot
-    : `${normalizedRoot}/`;
-  return normalizedTarget.startsWith(prefix)
-    ? normalizedTarget.slice(prefix.length)
-    : normalizedTarget;
-}
-
-function isIgnored(relativePath: string, ignoreHidden: boolean): boolean {
-  const segments = relativePath.split("/");
-  if (segments.includes(".git")) return true;
-  if (segments.includes("node_modules")) return true;
-  if (ignoreHidden && segments.some((segment) => segment.startsWith("."))) {
-    return true;
-  }
-  return false;
-}
-
-function parseProbe(stdout: string): RemoteTools {
-  const tools: RemoteTools = { rg: false, grep: false, find: false };
-  for (const line of stdout.split(/\r?\n/)) {
-    const [name, value] = line.trim().split("=");
-    if (name === "rg") tools.rg = value === "1";
-    if (name === "grep") tools.grep = value === "1";
-    if (name === "find") tools.find = value === "1";
-  }
-  return tools;
+function portableGrepWarning(): string {
+  return (
+    "This grep does not support --exclude-dir; hidden, .git, and node_modules " +
+    "matches are filtered after the search, so large trees may be truncated."
+  );
 }
 
 function textOf(value: unknown): string | undefined {
@@ -558,9 +582,87 @@ function safeJson(line: string): Record<string, any> | undefined {
   }
 }
 
-function commandFailure(tool: string, result: ExecResult): string {
-  const detail = result.stderr.trim() || result.stdout.trim() || "no output";
-  return `${tool} failed with exit code ${result.exitCode}: ${detail}`;
+function ignoredEngineWarnings(
+  engine: "grep" | "find" | "sftp",
+  includeIgnored: boolean | undefined,
+): string[] {
+  if (includeIgnored === true) return [];
+  return [
+    `${engine} cannot read .gitignore; results may include ignored files. ` +
+      "Install ripgrep for consistent ignore semantics.",
+  ];
+}
+
+const INPUT_ERROR_PATTERNS: readonly RegExp[] = [
+  /regex parse error/i,
+  /error parsing glob/i,
+  /invalid regular expression/i,
+  /invalid regex/i,
+  /unmatched [\[(]/i,
+  /trailing backslash/i,
+  /invalid character class/i,
+  /invalid repetition/i,
+  /invalid range/i,
+  /backreferences are not supported/i,
+  /look-around[^.]*not supported/i,
+  /unrecognized option/i,
+  /invalid option/i,
+  /unknown option/i,
+  /usage:/i,
+];
+
+/**
+ * A command that fails before producing any matches is usually a bad pattern
+ * or an unsupported option, not a "no matches" result. Surface it as an input
+ * error instead of returning an empty, warning-only result.
+ */
+function assertCommandInput(
+  label: string,
+  result: ExecResult,
+  matchCount: number,
+): void {
+  if (matchCount > 0 || result.exitCode !== 2) return;
+  const detail = result.stderr.trim();
+  if (detail.length === 0) return;
+  if (!INPUT_ERROR_PATTERNS.some((pattern) => pattern.test(detail))) return;
+
+  const unsupported = /unrecognized option|invalid option|unknown option|usage:/i.test(
+    detail,
+  );
+  throw new SshOperationError(
+    `${label} rejected the pattern or options: ${detail}`,
+    {
+      code: "SSH_INVALID_INPUT",
+      retryable: false,
+      hint: unsupported
+        ? "The remote grep does not support the required options. Install ripgrep with ssh_exec (ask the user first) or retry with literal=true."
+        : "Fix the pattern and retry. ripgrep uses Rust regex; grep uses POSIX extended regex. Use literal=true to search the text literally.",
+      executionMayHaveStarted: false,
+    },
+  );
+}
+
+function commandWarnings(
+  label: string,
+  result: ExecResult,
+  noMatchExitCode?: number,
+): { warnings: string[]; incomplete: boolean } {
+  const detail = result.stderr.trim();
+  const noMatch =
+    noMatchExitCode !== undefined && result.exitCode === noMatchExitCode;
+  const failed = !noMatch && result.exitCode !== 0;
+  const warnings: string[] = [];
+  if (failed) {
+    const code = result.exitCode === null ? "unknown" : result.exitCode;
+    warnings.push(
+      `${label} exited with code ${code}${
+        detail.length > 0 ? `: ${detail}` : ""
+      }; results may be incomplete.`,
+    );
+  } else if (detail.length > 0) {
+    warnings.push(`${label} reported: ${detail}`);
+  }
+  return { warnings, incomplete: failed };
 }
 
 function splitNul(value: string): string[] {
@@ -606,4 +708,58 @@ function callSftp(
 
 function clamp(value: number, minimum: number, maximum: number): number {
   return Math.min(maximum, Math.max(minimum, Math.trunc(value)));
+}
+
+function parseProbe(stdout: string): RemoteTools {
+  const tools: RemoteTools = {
+    rg: false,
+    grep: false,
+    find: false,
+    grepExtended: false,
+  };
+  for (const line of stdout.split(/\r?\n/)) {
+    const [name, value] = line.trim().split("=");
+    if (name === "rg") tools.rg = value === "1";
+    if (name === "grep") tools.grep = value === "1";
+    if (name === "find") tools.find = value === "1";
+    if (name === "grep_extended") tools.grepExtended = value === "1";
+  }
+  return tools;
+}
+
+/**
+ * Turn a path printed by ripgrep into an absolute remote path. ripgrep prints
+ * absolute paths for an absolute operand, but older versions and tests may
+ * print relative paths or a leading "./".
+ */
+function listedPath(root: string, entry: string): string {
+  const cleaned = entry.replace(/^\.\//, "");
+  return cleaned.startsWith("/")
+    ? posix.normalize(cleaned)
+    : posix.join(root, cleaned);
+}
+
+function relativeTo(root: string, target: string): string {
+  const normalizedRoot = posix.normalize(root);
+  const normalizedTarget = posix.normalize(target);
+  if (normalizedTarget === normalizedRoot) return ".";
+  const prefix = normalizedRoot.endsWith("/")
+    ? normalizedRoot
+    : `${normalizedRoot}/`;
+  return normalizedTarget.startsWith(prefix)
+    ? normalizedTarget.slice(prefix.length)
+    : normalizedTarget;
+}
+
+function isIgnored(relativePath: string, ignoreHidden: boolean): boolean {
+  // A search root that is itself a file has the relative path ".". It is an
+  // explicit target, so do not filter it even when it is hidden or named .git.
+  if (relativePath === "." || relativePath.length === 0) return false;
+  const segments = relativePath.split("/");
+  if (segments.includes(".git")) return true;
+  if (segments.includes("node_modules")) return true;
+  if (ignoreHidden && segments.some((segment) => segment.startsWith("."))) {
+    return true;
+  }
+  return false;
 }
