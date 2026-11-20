@@ -50,7 +50,14 @@ import {
   WatchNotifier,
   formatJobNotice,
   type JobNotice,
+  type WatchSource,
 } from "../src/ssh/watch-notifier.js";
+import {
+  CompositeSource,
+  HealthSource,
+  LogSource,
+  PidSource,
+} from "../src/ssh/watch-sources.js";
 import { OutputCollector } from "../src/util.js";
 import { createFakeSftp } from "./fake-sftp.js";
 
@@ -1819,6 +1826,104 @@ async function main() {
   };
 
   {
+    let probes = 0;
+    const pidSource = new PidSource({
+      exec: async (input) => {
+        if (input.command.startsWith("kill -0")) {
+          return { exitCode: probes++ === 0 ? 0 : 1, stdout: "" };
+        }
+        if (input.command.includes("tail -n")) {
+          return { exitCode: 0, stdout: "pid-tail\n" };
+        }
+        return { exitCode: 0, stdout: "" };
+      },
+      sshId: "ssh_test",
+      pid: 12345,
+      logPath: "/tmp/test.log",
+      logLines: 10,
+    });
+    const signal = new AbortController().signal;
+    assert.equal(
+      (await pidSource.check({ now: 0, signal })).state,
+      "pending",
+    );
+    const pidExited = await pidSource.check({ now: 1, signal });
+    assert.equal(pidExited.state, "exited");
+    assert.equal(pidExited.event, "pid-exited");
+    assert.match(pidExited.logTail ?? "", /pid-tail/);
+
+    const logSource = new LogSource({
+      exec: async () => ({ exitCode: 0, stdout: "Training complete\n" }),
+      sshId: "ssh_test",
+      logPath: "/tmp/train.log",
+      successRegex: "Training complete",
+    });
+    const logMatch = await logSource.check({ now: 0, signal });
+    assert.equal(logMatch.state, "exited");
+    assert.equal(logMatch.event, "log-matched");
+    assert.equal(logMatch.outcome, "success");
+
+    const healthSource = new HealthSource({
+      exec: async () => ({ exitCode: 0, stdout: "" }),
+      sshId: "ssh_test",
+      readyCommand: "true",
+      readyStableMs: 0,
+      readyIntervalMs: 1,
+      readyTimeoutMs: 1_000,
+    });
+    assert.equal(
+      (await healthSource.check({ now: 0, signal })).state,
+      "pending",
+    );
+    assert.equal(
+      (await healthSource.check({ now: 1, signal })).state,
+      "ready",
+    );
+
+    const readySource: WatchSource = {
+      kind: "health",
+      check: async () => ({ state: "ready", event: "ready" }),
+    };
+    const alivePid = new PidSource({
+      exec: async () => ({ exitCode: 0, stdout: "" }),
+      sshId: "ssh_test",
+      pid: 999,
+    });
+    const composite = new CompositeSource([readySource, alivePid]);
+    assert.equal((await composite.check({ now: 2, signal })).state, "ready");
+  }
+
+  {
+    const notices: JobNotice[] = [];
+    let checks = 0;
+    const source: WatchSource = {
+      kind: "pid",
+      check: async () =>
+        checks++ === 0
+          ? { state: "pending", nextIntervalMs: 1 }
+          : { state: "exited", event: "pid-exited", pid: 123, logTail: "done" },
+    };
+    const notifier = new WatchNotifier({
+      notify: async (notice) => {
+        notices.push(notice);
+      },
+      initialIntervalMs: 1,
+      maxIntervalMs: 1,
+    });
+    const watchId = notifier.watch({
+      source,
+      sessionID: "ses_generic",
+      name: "pid-test",
+    });
+    await waitFor(() => notices.length > 0);
+    assert.equal(notices[0]?.event, "pid-exited");
+    assert.equal(notices[0]?.pid, 123);
+    assert.equal(notices[0]?.watchId, watchId);
+    assert.match(notices[0] ? formatJobNotice(notices[0]) : "", /pid exited/);
+    notifier.dispose();
+  }
+
+  {
     const watchCalls: Array<Record<string, unknown>> = [];
     const notifyTools = new Map(
       createSshTools({
@@ -1885,6 +1990,78 @@ async function main() {
     assert.equal(watchCalls[0]?.readyStableMs, 0);
     assert.equal(watchCalls[0]?.watchAfterReady, true);
     assert.equal(watchCalls[0]?.logLines, 12);
+  }
+
+  {
+    const genericWatchCalls: Array<Record<string, unknown>> = [];
+    const genericTools = new Map(
+      createSshTools({
+        manager: {
+          getInfo: () => ({
+            id: "ssh_test",
+            name: "test",
+            user: "tester",
+            host: "127.0.0.1",
+            port: 22,
+            authMethod: "password",
+            connectedAt: new Date().toISOString(),
+            lastUsedAt: new Date().toISOString(),
+            idleMs: 0,
+            busy: false,
+          }),
+          exec: async () => ({ exitCode: 0, stdout: "" }),
+        } as unknown as ConnectionManager,
+        profiles: {} as ProfileStore,
+        config: { ...config },
+        search: {} as SearchService,
+        jobs: {} as JobService,
+        watchNotifier: {
+          watch: (input: Record<string, unknown>) => {
+            genericWatchCalls.push(input);
+            return "watch_generic";
+          },
+        } as unknown as WatchNotifier,
+      }).map((tool) => [tool.name, tool]),
+    );
+    const watchTool = genericTools.get("watch");
+    assert.ok(watchTool);
+    const genericContext = {
+      sessionID: "ses_generic",
+      agent: "build",
+      messageID: "msg_generic",
+      id: "call_generic",
+      signal: new AbortController().signal,
+      progress: async () => undefined,
+    };
+
+    const genericResult = await watchTool.execute(
+      {
+        ssh_id: "ssh_test",
+        pid: 123,
+        log_path: "/tmp/train.log",
+        success_regex: "Training complete",
+        timeout_ms: 1_000,
+      },
+      genericContext,
+    );
+    assert.match(genericResult.content, /watch_generic/);
+    assert.equal(genericWatchCalls.length, 1);
+    assert.equal(genericWatchCalls[0]?.sessionID, "ses_generic");
+    const source = genericWatchCalls[0]?.source as { kind?: string };
+    assert.equal(source.kind, "composite");
+
+    await assert.rejects(
+      () =>
+        watchTool.execute(
+          {
+            ssh_id: "ssh_test",
+            ready_command: "true",
+            watch_after_ready: true,
+          },
+          genericContext,
+        ),
+      /requires pid or pid_file/,
+    );
   }
 
   {

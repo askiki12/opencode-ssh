@@ -67,7 +67,9 @@ export default Plugin.define({
           delivery: "queue",
           metadata: {
             source: "opencode-ssh",
-            jobId: notice.jobId,
+            ...(notice.jobId !== undefined ? { jobId: notice.jobId } : {}),
+            watchId: notice.watchId,
+            kind: notice.kind,
             state: notice.state,
             event: notice.event,
             ...(notice.readiness !== undefined

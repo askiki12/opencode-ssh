@@ -41,10 +41,10 @@
 
 ### P2（低优先级）
 
-- [ ] **通用 WatchSource（pid / log / health）**
-  - v1 只支持 `ssh_job_start` 的完成/就绪通知，以及 `ssh_watch({ ssh_id, job_id })` 重连后 reattach。
-  - 下一步扩展 `ssh_watch`：pid / pid_file、日志成功/失败正则、`ready_command`、timeout；复用现有 `WatchNotifier` 核心，不另写通知/去重逻辑。
-  - 主要面向 `ssh_exec` 自 detach 的任务、已有 daemon、外部服务。
+- [ ] **Watch 增强：pid 复用校验 / 日志轮转**
+  - pid source 目前只做 `kill -0`，不能识别 pid 被复用；可增加命令行特征、start time 或 pid 文件 mtime 校验。
+  - log source 基于 `tail` 窗口，日志轮转或关键字在窗口外时可能漏报；可记录 offset 或使用 `tail -F` 长连接。
+  - 通用 `ssh_watch` 已实现 pid / log / health / timeout；这些是后续可靠性增强。
 
 - [ ] **readiness 标记持久化**
   - 当前 `ssh_job_status` 的 `readiness` / `ready_at` 来自内存中的 `WatchNotifier`，插件重启后丢失。
@@ -111,7 +111,8 @@
 
 ## 已完成
 
-- 2026-11-20：v1 job 通知（分支 `feat/job-notifications`）：`WatchNotifier` + `JobSource`；`ssh_job_start` 默认注册完成/就绪通知，支持 `job_notify`、`job_notify_log_lines`、`ready_command`、`ready_timeout_ms`、`ready_interval_ms`、`ready_stable_ms`、`watch_after_ready`；终态通过 `session.synthetic({ resume: true })` 唤醒会话；新增 `ssh_watch({ ssh_id, job_id })` 用于重连后 reattach，以及 `ssh_unwatch` / `ssh_watch_list`；`ssh_exec` 描述明确自 detach 不追踪。readiness 状态暂存内存，持久化待后续。
+- 2026-11-20：v1 job 通知（分支 `feat/job-notifications`）：`WatchNotifier` + `JobSource`；`ssh_job_start` 默认注册完成/就绪通知，支持 `job_notify`、`job_notify_log_lines`、`ready_command`、`ready_timeout_ms`、`ready_interval_ms`、`ready_stable_ms`、`watch_after_ready`；终态通过 `session.synthetic({ resume: true })` 唤醒会话；新增 `ssh_watch` / `ssh_unwatch` / `ssh_watch_list`；`ssh_exec` 描述明确自 detach 不追踪。readiness 状态暂存内存，持久化待后续。
+- 2026-11-20：通用 watch（同一分支）：`ssh_watch` 支持 `job_id` reattach、`pid` / `pid_file`、`log_path` + `success_regex` / `failure_regex`、`ready_command`、`timeout_ms`；新增 `watch-types.ts` / `watch-sources.ts`（Job / Pid / Log / Health / Timeout / Composite source），复用同一 `WatchNotifier` 调度、去重和 synthetic 唤醒。
 - 2026-11：7 个工具（connect / disconnect / list / exec / profile_add / profile_update / profile_remove / profile_list）实现完毕。
 - 2026-11：profile 迁移到 `ctx.storage`（SQLite），移除 `profiles.json`。
 - 2026-11：密码、私钥口令、sudo 密码使用 AES-256-GCM 加密；活跃连接和 sudo 密码仅保存在内存。

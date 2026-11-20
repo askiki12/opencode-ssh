@@ -1,14 +1,28 @@
 import { randomBytes } from "node:crypto";
-import type { JobInfo, JobState, JobService } from "./jobs.js";
+import type { JobService } from "./jobs.js";
+import { JobSource } from "./watch-sources.js";
+import type {
+  JobReadiness,
+  WatchCheck,
+  WatchEvent,
+  WatchNotice,
+  WatchSource,
+  WatchState,
+  WatchSummary,
+} from "./watch-types.js";
 
-export type JobNoticeEvent =
-  | "exit"
-  | "ready"
-  | "timeout"
-  | "service-exited"
-  | "monitor-stopped";
+export type {
+  JobReadiness,
+  WatchEvent,
+  WatchKind,
+  WatchNotice,
+  WatchSource,
+  WatchState,
+  WatchSummary,
+} from "./watch-types.js";
 
-export type JobReadiness = "pending" | "ready" | "failed" | "timeout";
+export type JobNotice = WatchNotice;
+export type JobNoticeEvent = WatchEvent;
 
 export interface WatchJobInput {
   sshId: string;
@@ -18,39 +32,29 @@ export interface WatchJobInput {
   name?: string;
   hostLabel?: string;
   logLines?: number;
-  /** When set, the job is treated as a service and probed until ready. */
   readyCommand?: string;
   readyTimeoutMs?: number;
   readyIntervalMs?: number;
   readyStableMs?: number;
-  /** Continue watching for an exit after the service becomes ready. */
   watchAfterReady?: boolean;
 }
 
-export interface JobNotice {
-  event: JobNoticeEvent;
-  sshId: string;
-  jobId: string;
+export interface WatchInput {
+  source: WatchSource;
   sessionID: string;
   agent?: string;
   name?: string;
   hostLabel?: string;
-  state: JobState;
-  readiness?: JobReadiness;
-  readyAt?: number;
-  exitCode?: number | null;
-  pid?: number;
-  elapsedMs?: number;
-  elapsedSinceReadyMs?: number;
-  logPath?: string;
-  logTail?: string;
-  message?: string;
+  logLines?: number;
+  initialIntervalMs?: number;
+  maxIntervalMs?: number;
+  watchAfterReady?: boolean;
+  sshId?: string;
+  jobId?: string;
 }
 
 export interface WatchNotifierOptions {
-  jobs: Pick<JobService, "status">;
-  notify: (notice: JobNotice) => Promise<void>;
-  /** Phase 1.5: execute ready_command through the SSH connection. */
+  jobs?: Pick<JobService, "status">;
   runProbe?: (input: {
     sshId: string;
     jobId: string;
@@ -58,6 +62,7 @@ export interface WatchNotifierOptions {
     command: string;
     timeoutMs: number;
   }) => Promise<boolean>;
+  notify: (notice: WatchNotice) => Promise<void>;
   logLines?: number;
   initialIntervalMs?: number;
   maxIntervalMs?: number;
@@ -72,115 +77,143 @@ export interface WatchNotifierOptions {
   sleep?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
 }
 
-export interface WatchSummary {
-  watchId: string;
-  sshId: string;
-  jobId: string;
-  sessionID: string;
-  name?: string;
-  hostLabel?: string;
-  /** Only present for service jobs with ready_command. */
-  readiness?: JobReadiness;
-  startedAt: number;
-}
-
 interface CompletedWatch {
   readiness: JobReadiness;
   readyAt?: number;
   completedAt: number;
 }
 
-interface JobWatchRecord extends Required<Pick<WatchJobInput, "sshId" | "jobId" | "sessionID">> {
+interface WatchRecord {
   watchId: string;
   key: string;
+  source: WatchSource;
+  sessionID: string;
   agent?: string;
   name?: string;
   hostLabel?: string;
+  sshId?: string;
+  jobId?: string;
   logLines: number;
-  readyCommand?: string;
-  readyTimeoutMs: number;
-  readyIntervalMs: number;
-  readyStableMs: number;
   watchAfterReady: boolean;
+  initialIntervalMs: number;
+  maxIntervalMs: number;
   startedAt: number;
-  readiness: JobReadiness;
-  readySuccesses: number;
-  readySince?: number;
+  state: WatchState;
+  readiness?: JobReadiness;
   readyAt?: number;
   notified: boolean;
   crashNotified: boolean;
   failures: number;
   intervalMs: number;
   abort: AbortController;
-  lastInfo?: JobInfo;
 }
 
-const TERMINAL_STATES: ReadonlySet<JobState> = new Set([
-  "finished",
-  "stopped",
-  "lost",
-  "corrupt",
-]);
-
-const MIN_READY_CHECKS = 2;
-
 export class WatchNotifier {
-  private readonly active = new Map<string, JobWatchRecord>();
+  private readonly active = new Map<string, WatchRecord>();
   private readonly completed = new Map<string, CompletedWatch>();
 
   constructor(private readonly options: WatchNotifierOptions) {}
 
-  /**
-   * Start watching a job. Passing the same sshId/jobId twice returns the
-   * existing watch instead of creating a duplicate notification stream.
-   */
+  /** Convenience entry point used by ssh_job_start. */
   watchJob(input: WatchJobInput): string {
-    const key = `${input.sshId}:${input.jobId}`;
+    if (this.options.jobs === undefined) {
+      throw new Error("Job notifications are not configured.");
+    }
+
+    const source = new JobSource({
+      jobs: this.options.jobs,
+      sshId: input.sshId,
+      jobId: input.jobId,
+      logLines: input.logLines ?? this.options.logLines ?? 40,
+      initialIntervalMs:
+        this.options.initialIntervalMs ?? 5_000,
+      ...(this.options.runProbe !== undefined
+        ? { runProbe: this.options.runProbe }
+        : {}),
+      ...(input.readyCommand !== undefined
+        ? { readyCommand: input.readyCommand }
+        : {}),
+      readyTimeoutMs:
+        input.readyTimeoutMs ?? this.options.readyTimeoutMs ?? 1_200_000,
+      readyIntervalMs:
+        input.readyIntervalMs ?? this.options.readyIntervalMs ?? 5_000,
+      readyStableMs:
+        input.readyStableMs ?? this.options.readyStableMs ?? 5_000,
+    });
+
+    return this.watch({
+      source,
+      sessionID: input.sessionID,
+      ...(input.agent !== undefined ? { agent: input.agent } : {}),
+      ...(input.name !== undefined ? { name: input.name } : {}),
+      ...(input.hostLabel !== undefined ? { hostLabel: input.hostLabel } : {}),
+      ...(input.logLines !== undefined ? { logLines: input.logLines } : {}),
+      ...(input.watchAfterReady !== undefined
+        ? { watchAfterReady: input.watchAfterReady }
+        : {}),
+      sshId: input.sshId,
+      jobId: input.jobId,
+    });
+  }
+
+  /** Register any WatchSource. This is the generic entry point for ssh_watch. */
+  watch(input: WatchInput): string {
+    const key =
+      input.jobId !== undefined && input.sshId !== undefined
+        ? `${input.sshId}:${input.jobId}`
+        : `watch:${input.source.kind}:${randomBytes(6).toString("hex")}`;
+
     const existing = [...this.active.values()].find((record) => record.key === key);
     if (existing) return existing.watchId;
 
     // Reattaching with a new ssh_id must supersede the old watch for the same
     // job; otherwise the disconnected watch can emit a late "monitor stopped".
-    for (const record of [...this.active.values()]) {
-      if (record.jobId !== input.jobId) continue;
-      record.abort.abort();
-      this.active.delete(record.watchId);
+    if (input.jobId !== undefined) {
+      for (const record of [...this.active.values()]) {
+        if (record.jobId !== input.jobId) continue;
+        record.abort.abort();
+        this.active.delete(record.watchId);
+      }
     }
 
-    const watchId = `watch_${randomBytes(6).toString("hex")}`;
-    const record: JobWatchRecord = {
-      watchId,
+    const record: WatchRecord = {
+      watchId: `watch_${randomBytes(6).toString("hex")}`,
       key,
-      sshId: input.sshId,
-      jobId: input.jobId,
+      source: input.source,
       sessionID: input.sessionID,
       ...(input.agent !== undefined ? { agent: input.agent } : {}),
       ...(input.name !== undefined ? { name: input.name } : {}),
       ...(input.hostLabel !== undefined ? { hostLabel: input.hostLabel } : {}),
+      ...(input.sshId !== undefined ? { sshId: input.sshId } : {}),
+      ...(input.jobId !== undefined ? { jobId: input.jobId } : {}),
       logLines: input.logLines ?? this.options.logLines ?? 40,
-      ...(input.readyCommand !== undefined
-        ? { readyCommand: input.readyCommand }
-        : {}),
-      readyTimeoutMs: input.readyTimeoutMs ?? this.options.readyTimeoutMs ?? 1_200_000,
-      readyIntervalMs: input.readyIntervalMs ?? this.options.readyIntervalMs ?? 5_000,
-      readyStableMs: input.readyStableMs ?? this.options.readyStableMs ?? 5_000,
       watchAfterReady:
         input.watchAfterReady ?? this.options.watchAfterReady ?? false,
+      initialIntervalMs:
+        input.initialIntervalMs ?? this.options.initialIntervalMs ?? 5_000,
+      maxIntervalMs:
+        input.maxIntervalMs ?? this.options.maxIntervalMs ?? 60_000,
       startedAt: this.now(),
-      readiness: "pending",
-      readySuccesses: 0,
+      state: "pending",
+      ...(input.source.readiness !== undefined
+        ? { readiness: input.source.readiness }
+        : {}),
+      ...(input.source.readyAt !== undefined
+        ? { readyAt: input.source.readyAt }
+        : {}),
       notified: false,
       crashNotified: false,
       failures: 0,
-      intervalMs: this.options.initialIntervalMs ?? 5_000,
+      intervalMs:
+        input.initialIntervalMs ?? this.options.initialIntervalMs ?? 5_000,
       abort: new AbortController(),
     };
 
-    this.active.set(watchId, record);
+    this.active.set(record.watchId, record);
     void this.run(record).catch((error) => {
       this.options.onError?.(error);
     });
-    return watchId;
+    return record.watchId;
   }
 
   unwatch(watchId: string): boolean {
@@ -195,20 +228,21 @@ export class WatchNotifier {
     return [...this.active.values()]
       .map((record) => ({
         watchId: record.watchId,
-        sshId: record.sshId,
-        jobId: record.jobId,
+        kind: record.source.kind,
+        ...(record.jobId !== undefined ? { jobId: record.jobId } : {}),
+        ...(record.sshId !== undefined ? { sshId: record.sshId } : {}),
         sessionID: record.sessionID,
         ...(record.name !== undefined ? { name: record.name } : {}),
         ...(record.hostLabel !== undefined ? { hostLabel: record.hostLabel } : {}),
-        ...(record.readyCommand !== undefined
+        ...(record.readiness !== undefined
           ? { readiness: record.readiness }
           : {}),
+        state: record.state,
         startedAt: record.startedAt,
       }))
       .sort((left, right) => left.startedAt - right.startedAt);
   }
 
-  /** Used by ssh_job_status to show readiness without reading the remote job dir. */
   describe(
     sshId: string,
     jobId: string,
@@ -216,7 +250,9 @@ export class WatchNotifier {
     const key = `${sshId}:${jobId}`;
     const record = [...this.active.values()].find((item) => item.key === key);
     if (record) {
-      if (!record.readyCommand && record.readyAt === undefined) return undefined;
+      if (record.source.kind !== "job" || record.readiness === undefined) {
+        return undefined;
+      }
       return {
         readiness: record.readiness,
         ...(record.readyAt !== undefined ? { readyAt: record.readyAt } : {}),
@@ -237,97 +273,104 @@ export class WatchNotifier {
     this.completed.clear();
   }
 
-  private async run(record: JobWatchRecord): Promise<void> {
+  private async run(record: WatchRecord): Promise<void> {
     try {
       while (!record.abort.signal.aborted) {
-        let info: JobInfo;
+        let check: WatchCheck;
         try {
-          const result = await this.options.jobs.status(
-            record.sshId,
-            record.jobId,
-            0,
-          );
-          if (Array.isArray(result)) {
-            throw new Error("Expected a single job status.");
-          }
-          info = result;
-          record.lastInfo = info;
-          record.failures = 0;
-          if (record.abort.signal.aborted) return;
+          check = await record.source.check({
+            now: this.now(),
+            signal: record.abort.signal,
+          });
         } catch (error) {
           if (record.abort.signal.aborted) return;
           record.failures += 1;
           if (record.failures >= (this.options.maxFailures ?? 10)) {
-            await this.notifyMonitorStopped(record, error);
+            await this.notifyMonitorStopped(record, errorMessage(error));
             return;
           }
           record.intervalMs = Math.min(
-            this.options.maxIntervalMs ?? 60_000,
+            record.maxIntervalMs,
             Math.max(
               record.intervalMs * 2,
-              this.options.initialIntervalMs ?? 5_000,
+              record.initialIntervalMs,
             ),
           );
           await this.sleep(record.intervalMs, record.abort.signal);
           continue;
         }
 
-        if (TERMINAL_STATES.has(info.state)) {
-          const detailed = await this.withLogTail(record, info);
-          if (record.readyAt !== undefined && record.watchAfterReady) {
-            await this.notifyServiceExited(record, detailed);
-          } else {
-            await this.notifyExit(record, detailed);
-          }
-          return;
+        if (record.abort.signal.aborted) return;
+        record.failures = 0;
+        record.state =
+          check.state === "pending" && record.readyAt !== undefined
+            ? "ready"
+            : check.state;
+        if (check.readiness !== undefined) {
+          record.readiness = check.readiness;
+        }
+        if (check.readyAt !== undefined) {
+          record.readyAt = check.readyAt;
         }
 
-        if (record.readyCommand !== undefined && record.readyAt === undefined) {
-          const ok = await this.probe(record, info);
-          if (record.abort.signal.aborted) return;
-          const now = this.now();
+        switch (check.state) {
+          case "pending":
+            record.intervalMs =
+              check.nextIntervalMs ??
+              nextInterval(
+                this.now() - record.startedAt,
+                record.initialIntervalMs,
+                record.maxIntervalMs,
+              );
+            await this.sleep(record.intervalMs, record.abort.signal);
+            break;
 
-          if (ok) {
-            if (record.readySince === undefined) record.readySince = now;
-            record.readySuccesses += 1;
-            const stableFor = now - record.readySince;
-            if (
-              record.readySuccesses >= MIN_READY_CHECKS &&
-              stableFor >= record.readyStableMs
-            ) {
-              record.readiness = "ready";
-              record.readyAt = now;
-              await this.notifyReady(record, info);
-              if (!record.watchAfterReady) return;
+          case "ready":
+            if (!record.notified) {
+              record.notified = true;
+              await this.emit(record, check, "ready");
             }
-          } else {
-            delete record.readySince;
-            record.readySuccesses = 0;
-          }
+            if (!record.watchAfterReady) return;
+            await this.sleep(
+              check.nextIntervalMs ?? record.intervalMs,
+              record.abort.signal,
+            );
+            break;
 
-          if (now - record.startedAt >= record.readyTimeoutMs) {
-            record.readiness = "timeout";
-            await this.notifyTimeout(record, info);
+          case "timeout":
+            if (record.notified) {
+              if (record.crashNotified) return;
+              record.crashNotified = true;
+            } else {
+              record.notified = true;
+            }
+            await this.emit(record, check, "timeout");
             return;
-          }
-        }
 
-        const elapsed = this.now() - record.startedAt;
-        record.intervalMs = nextInterval(
-          elapsed,
-          this.options.initialIntervalMs ?? 5_000,
-          this.options.maxIntervalMs ?? 60_000,
-        );
-        const sleepMs =
-          record.readyCommand !== undefined && record.readyAt === undefined
-            ? record.readyIntervalMs
-            : record.intervalMs;
-        await this.sleep(sleepMs, record.abort.signal);
+          case "monitor-stopped":
+            await this.notifyMonitorStopped(record, check.message);
+            return;
+
+          case "exited":
+            if (record.readyAt !== undefined) {
+              if (record.crashNotified) return;
+              record.crashNotified = true;
+              await this.emit(record, check, "service-exited");
+            } else if (!record.notified) {
+              record.notified = true;
+              await this.emit(record, check, check.event ?? "exit");
+            }
+            return;
+        }
       }
     } finally {
       this.active.delete(record.watchId);
-      if (record.readyCommand !== undefined) {
-        this.completed.set(record.key, {
+      if (
+        record.jobId !== undefined &&
+        record.sshId !== undefined &&
+        record.readiness !== undefined
+      ) {
+        this.completed.set(`${record.sshId}:${record.jobId}`, {
           readiness: record.readiness,
           ...(record.readyAt !== undefined ? { readyAt: record.readyAt } : {}),
           completedAt: this.now(),
@@ -336,88 +379,9 @@ export class WatchNotifier {
     }
   }
 
-  private async withLogTail(
-    record: JobWatchRecord,
-    info: JobInfo,
-  ): Promise<JobInfo> {
-    if (record.logLines <= 0 || info.log !== undefined) return info;
-    try {
-      const result = await this.options.jobs.status(
-        record.sshId,
-        record.jobId,
-        record.logLines,
-      );
-      return Array.isArray(result) ? info : result;
-    } catch {
-      return info;
-    }
-  }
-
-  private async probe(record: JobWatchRecord, info: JobInfo): Promise<boolean> {
-    if (this.options.runProbe === undefined || record.readyCommand === undefined) {
-      return false;
-    }
-    try {
-      return await this.options.runProbe({
-        sshId: record.sshId,
-        jobId: record.jobId,
-        jobDir: info.jobDir,
-        command: record.readyCommand,
-        timeoutMs: 10_000,
-      });
-    } catch {
-      return false;
-    }
-  }
-
-  private async notifyExit(record: JobWatchRecord, info: JobInfo): Promise<void> {
-    if (record.notified) return;
-    record.notified = true;
-    if (record.readyCommand !== undefined) record.readiness = "failed";
-    await this.emit(record, info, {
-      event: "exit",
-      ...(record.readyCommand !== undefined ? { readiness: "failed" } : {}),
-    });
-  }
-
-  private async notifyReady(record: JobWatchRecord, info: JobInfo): Promise<void> {
-    if (record.notified) return;
-    record.notified = true;
-    record.readiness = "ready";
-    await this.emit(record, info, {
-      event: "ready",
-      readiness: "ready",
-    });
-  }
-
-  private async notifyTimeout(record: JobWatchRecord, info: JobInfo): Promise<void> {
-    if (record.notified) return;
-    record.notified = true;
-    record.readiness = "timeout";
-    await this.emit(record, info, {
-      event: "timeout",
-      readiness: "timeout",
-    });
-  }
-
-  private async notifyServiceExited(
-    record: JobWatchRecord,
-    info: JobInfo,
-  ): Promise<void> {
-    if (record.crashNotified) return;
-    record.crashNotified = true;
-    await this.emit(record, info, {
-      event: "service-exited",
-      readiness: "ready",
-      ...(record.readyAt !== undefined
-        ? { elapsedSinceReadyMs: Math.max(0, this.now() - record.readyAt) }
-        : {}),
-    });
-  }
-
   private async notifyMonitorStopped(
-    record: JobWatchRecord,
-    error: unknown,
+    record: WatchRecord,
+    message: string | undefined,
   ): Promise<void> {
     if (record.notified) {
       if (record.crashNotified) return;
@@ -426,55 +390,68 @@ export class WatchNotifier {
       record.notified = true;
     }
 
-    const info = record.lastInfo;
-    if (info === undefined) {
-      await this.emitNotice({
-        event: "monitor-stopped",
-        sshId: record.sshId,
-        jobId: record.jobId,
-        sessionID: record.sessionID,
-        ...(record.agent !== undefined ? { agent: record.agent } : {}),
-        ...(record.name !== undefined ? { name: record.name } : {}),
-        ...(record.hostLabel !== undefined ? { hostLabel: record.hostLabel } : {}),
-        state: "lost",
-        message: errorMessage(error),
-      });
-      return;
-    }
-
-    await this.emit(record, info, {
-      event: "monitor-stopped",
-      message: errorMessage(error),
-    });
-  }
-
-  private async emit(
-    record: JobWatchRecord,
-    info: JobInfo,
-    extra: Partial<JobNotice> & Pick<JobNotice, "event">,
-  ): Promise<void> {
     await this.emitNotice({
-      sshId: record.sshId,
-      jobId: record.jobId,
+      event: "monitor-stopped",
+      kind: record.source.kind,
+      watchId: record.watchId,
+      ...(record.jobId !== undefined ? { jobId: record.jobId } : {}),
+      ...(record.sshId !== undefined ? { sshId: record.sshId } : {}),
       sessionID: record.sessionID,
       ...(record.agent !== undefined ? { agent: record.agent } : {}),
       ...(record.name !== undefined ? { name: record.name } : {}),
       ...(record.hostLabel !== undefined ? { hostLabel: record.hostLabel } : {}),
-      state: info.state,
-      ...(record.readyCommand !== undefined || record.readyAt !== undefined
+      state: "lost",
+      ...(record.readiness !== undefined
         ? { readiness: record.readiness }
         : {}),
       ...(record.readyAt !== undefined ? { readyAt: record.readyAt } : {}),
-      ...(info.exitCode !== undefined ? { exitCode: info.exitCode } : {}),
-      ...(info.pid !== undefined ? { pid: info.pid } : {}),
-      ...(info.elapsedMs !== undefined ? { elapsedMs: info.elapsedMs } : {}),
-      ...(info.logPath !== undefined ? { logPath: info.logPath } : {}),
-      ...(info.log !== undefined ? { logTail: info.log } : {}),
-      ...extra,
+      ...(message !== undefined ? { message } : {}),
+      elapsedMs: Math.max(0, this.now() - record.startedAt),
     });
   }
 
-  private async emitNotice(notice: JobNotice): Promise<void> {
+  private async emit(
+    record: WatchRecord,
+    check: WatchCheck,
+    event: WatchEvent,
+  ): Promise<void> {
+    const state =
+      check.state === "exited"
+        ? "finished"
+        : check.state === "monitor-stopped"
+          ? "lost"
+          : "running";
+    const readiness = check.readiness ?? record.readiness;
+    const readyAt = check.readyAt ?? record.readyAt;
+
+    await this.emitNotice({
+      event,
+      kind: record.source.kind,
+      watchId: record.watchId,
+      ...(record.jobId !== undefined ? { jobId: record.jobId } : {}),
+      ...(record.sshId !== undefined ? { sshId: record.sshId } : {}),
+      sessionID: record.sessionID,
+      ...(record.agent !== undefined ? { agent: record.agent } : {}),
+      ...(record.name !== undefined ? { name: record.name } : {}),
+      ...(record.hostLabel !== undefined ? { hostLabel: record.hostLabel } : {}),
+      state,
+      ...(readiness !== undefined ? { readiness } : {}),
+      ...(readyAt !== undefined ? { readyAt } : {}),
+      ...(check.exitCode !== undefined ? { exitCode: check.exitCode } : {}),
+      ...(check.pid !== undefined ? { pid: check.pid } : {}),
+      ...(check.logPath !== undefined ? { logPath: check.logPath } : {}),
+      ...(check.logTail !== undefined ? { logTail: check.logTail } : {}),
+      ...(check.message !== undefined ? { message: check.message } : {}),
+      ...(check.pattern !== undefined ? { pattern: check.pattern } : {}),
+      ...(check.outcome !== undefined ? { outcome: check.outcome } : {}),
+      elapsedMs: Math.max(0, this.now() - record.startedAt),
+      ...(readyAt !== undefined
+        ? { elapsedSinceReadyMs: Math.max(0, this.now() - readyAt) }
+        : {}),
+    });
+  }
+
+  private async emitNotice(notice: WatchNotice): Promise<void> {
     try {
       await this.options.notify(notice);
     } catch (error) {
@@ -491,7 +468,7 @@ export class WatchNotifier {
   }
 }
 
-export function formatJobNotice(notice: JobNotice): string {
+export function formatWatchNotice(notice: WatchNotice): string {
   const title =
     notice.event === "ready"
       ? "[ssh service ready]"
@@ -499,23 +476,33 @@ export function formatJobNotice(notice: JobNotice): string {
         ? "[ssh service timeout]"
         : notice.event === "service-exited"
           ? "[ssh service exited]"
-          : notice.event === "monitor-stopped"
-            ? "[ssh job monitor stopped]"
-            : notice.readiness === "failed"
-              ? "[ssh service failed]"
-              : `[ssh job ${notice.state}]`;
+          : notice.event === "pid-exited"
+            ? "[ssh watch: pid exited]"
+            : notice.event === "log-matched"
+              ? "[ssh watch: log matched]"
+              : notice.event === "monitor-stopped"
+                ? "[ssh watch monitor stopped]"
+                : notice.readiness === "failed"
+                  ? "[ssh service failed]"
+                  : `[ssh job ${notice.state}]`;
 
   const lines = [
     title,
-    `job_id: ${notice.jobId}`,
+    ...(notice.jobId !== undefined ? [`job_id: ${notice.jobId}`] : []),
+    `watch_id: ${notice.watchId}`,
+    ...(notice.jobId === undefined ? [`kind: ${notice.kind}`] : []),
     ...(notice.name !== undefined ? [`name: ${notice.name}`] : []),
     ...(notice.hostLabel !== undefined ? [`host: ${notice.hostLabel}`] : []),
     `state: ${notice.state}`,
-    ...(notice.readiness !== undefined ? [`readiness: ${notice.readiness}`] : []),
+    ...(notice.readiness !== undefined
+      ? [`readiness: ${notice.readiness}`]
+      : []),
     ...(notice.readyAt !== undefined
       ? [`ready_at: ${new Date(notice.readyAt).toISOString()}`]
       : []),
-    ...(notice.exitCode !== undefined ? [`exit_code: ${notice.exitCode}`] : []),
+    ...(notice.exitCode !== undefined
+      ? [`exit_code: ${notice.exitCode}`]
+      : []),
     ...(notice.pid !== undefined ? [`pid: ${notice.pid}`] : []),
     ...(notice.elapsedMs !== undefined
       ? [`elapsed: ${formatDuration(notice.elapsedMs)}`]
@@ -524,22 +511,33 @@ export function formatJobNotice(notice: JobNotice): string {
       ? [`elapsed_since_ready: ${formatDuration(notice.elapsedSinceReadyMs)}`]
       : []),
     ...(notice.logPath !== undefined ? [`log: ${notice.logPath}`] : []),
+    ...(notice.outcome !== undefined ? [`outcome: ${notice.outcome}`] : []),
+    ...(notice.pattern !== undefined ? [`pattern: ${notice.pattern}`] : []),
     "",
     notice.event === "ready"
       ? "服务已就绪，job 仍在运行。需要停止时调用 ssh_job_stop({ ssh_id, job_id })。"
       : notice.event === "timeout"
-        ? "超过 ready_timeout_ms 仍未就绪，进程可能仍在加载或卡住。请检查日志；需要终止时调用 ssh_job_stop。"
+        ? "超过超时时间仍未就绪，进程可能仍在加载或卡住。请检查日志。"
         : notice.event === "service-exited"
           ? "服务在就绪后退出，请检查日志并向用户汇报。"
-          : notice.event === "monitor-stopped"
-            ? `无法继续监控该 job${notice.message !== undefined ? `：${notice.message}` : ""}。job 本身可能仍在运行，请重新连接后调用 ssh_job_status 检查。`
-            : "请现在向用户汇报结果。如果需要更多上下文，调用 ssh_job_status({ ssh_id, job_id, log_lines })。",
+          : notice.event === "pid-exited"
+            ? "后台进程已退出。请读取日志并向用户汇报。"
+            : notice.event === "log-matched"
+              ? `日志命中${notice.outcome === "failure" ? "失败" : "成功"}关键字，请向用户汇报。`
+              : notice.event === "monitor-stopped"
+                ? `无法继续监控该任务${notice.message !== undefined ? `：${notice.message}` : ""}。任务本身可能仍在运行，请重新连接后检查。`
+                : "请现在向用户汇报结果。",
   ];
 
   if (notice.logTail !== undefined && notice.logTail.length > 0) {
     lines.push("", "Tail:", notice.logTail);
   }
   return lines.join("\n");
+}
+
+/** Backward-compatible alias for the job-focused formatter. */
+export function formatJobNotice(notice: WatchNotice): string {
+  return formatWatchNotice(notice);
 }
 
 function nextInterval(elapsed: number, initial: number, maximum: number): number {

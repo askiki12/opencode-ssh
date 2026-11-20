@@ -33,7 +33,9 @@ src/ssh/manager.ts            持久连接池、连接/断开/执行、取消与
 src/ssh/files.ts              SFTP 文件读写、编辑、删除、传输
 src/ssh/search.ts             远端 glob/grep 与引擎回退
 src/ssh/jobs.ts               远端长任务注册表与进程组停止
-src/ssh/watch-notifier.ts     job 完成/就绪通知与 synthetic 唤醒
+src/ssh/watch-notifier.ts     通知订阅、调度、去重与 synthetic 唤醒
+src/ssh/watch-sources.ts      Job / pid / log / health / timeout watch source
+src/ssh/watch-types.ts        WatchSource / WatchCheck / WatchNotice 类型
 src/tools/definitions.ts      工具定义与返回格式化
 src/rpc.ts                    TUI 与 server 之间的 RPC 契约
 src/rpc-handlers.ts           RPC 实现（连接测试、profile 测试后再保存）
@@ -345,7 +347,7 @@ sudo 示例（需要 profile 或连接上保存了 `sudo_password`）：
 | `ssh_job_start` | 后台启动命令，立即返回 `job_id`、pid、job 目录和日志路径；默认注册完成/就绪通知 |
 | `ssh_job_status` | 查询单个 job；省略 `job_id` 时列出最近 100 个 job；`log_lines` 取日志尾部 |
 | `ssh_job_stop` | 先 `SIGTERM`，宽限后 `SIGKILL`，按进程组终止 |
-| `ssh_watch` | 重连后把已有 `job_id` 重新挂上通知；v1 只支持 job 模式 |
+| `ssh_watch` | 重新挂已有 `job_id`，或监控任意进程/服务的 pid、日志、health、超时 |
 | `ssh_unwatch` | 取消一个通知 watch，不停止任务 |
 | `ssh_watch_list` | 列出活跃的通知 watch |
 
@@ -424,7 +426,52 @@ vLLM 示例：
 
 `ssh_watch` 只重新注册通知，不启动或停止 job；不要再次调用 `ssh_job_start`，否则会新建 job。
 
-> `ssh_exec` 自己 `nohup ... &` 后脱离的任务不会被追踪，也不会产生通知。长任务请用 `ssh_job_start`；v1 的 `ssh_watch` 只支持已有 `job_id` 的 reattach，通用 pid/log/health watch 尚未实现。
+> `ssh_exec` 自己 `nohup ... &` 后脱离的任务不会被 `ssh_exec` 追踪，也不会自动产生通知。长任务优先用 `ssh_job_start`；已经 detach 的任务、已有 daemon 或外部服务用 `ssh_watch`。
+
+通用 `ssh_watch` 的条件：
+
+| 条件 | 说明 |
+| --- | --- |
+| `job_id` | 重连后重新挂已有 job，不启动/停止 job |
+| `pid` / `pid_file` | `kill -0` 监控进程，进程消失通知 `pid-exited` |
+| `log_path` + `success_regex` / `failure_regex` | 日志命中成功/失败关键字时通知 |
+| `ready_command` | 服务就绪探测，支持 `ready_timeout_ms` / `ready_interval_ms` / `ready_stable_ms` |
+| `timeout_ms` | 整体超时兜底 |
+
+`watch_after_ready` 用于“服务就绪后继续监督崩溃”，需要同时提供 `pid` 或 `pid_file`。
+
+自 detach 训练任务示例：
+
+```sh
+nohup python train.py > /tmp/train.log 2>&1 &
+echo $! > /tmp/train.pid
+```
+
+```json
+{
+  "ssh_id": "ssh_...",
+  "pid_file": "/tmp/train.pid",
+  "log_path": "/tmp/train.log",
+  "success_regex": "Training complete",
+  "failure_regex": "Traceback|OOM|Killed",
+  "timeout_ms": 86400000
+}
+```
+
+已有 vLLM 服务：
+
+```json
+{
+  "ssh_id": "ssh_...",
+  "pid_file": "/tmp/vllm.pid",
+  "log_path": "/tmp/vllm.log",
+  "ready_command": "curl -fsS -m 3 http://127.0.0.1:8000/health",
+  "ready_timeout_ms": 1200000,
+  "watch_after_ready": true
+}
+```
+
+`ssh_unwatch({ watch_id })` 只取消通知，不停止任务；`ssh_watch_list()` 列出活跃 watch。
 
 ### 2.11 sudo 密码的已知限制
 
@@ -692,7 +739,8 @@ Profile 的 `prof_...` 是内部 id，只用于 RPC/存储，不在列表和选�
 - 不支持 OTP / 2FA 的多轮 keyboard-interactive（当前把密码用于所有 prompt）；
 - 不读取 OpenSSH `~/.ssh/config` 和 `known_hosts`；
 - 每条 `ssh_exec` 是独立 channel，shell 状态不持久；`ssh_exec` 自己 detach 的后台任务不会被追踪，也不会产生通知；
-- `ssh_watch` v1 只支持已有 `job_id` 的 reattach，通用 pid / log / health watch 尚未实现；
+- `ssh_watch` 的 pid 监控只做 `kill -0`，不校验 pid 是否被复用；长任务建议同时提供日志成功/失败正则；
+- `ssh_watch` 的日志正则基于 `tail` 窗口，日志轮转或关键字在窗口外时可能漏报；
 - job 的 `readiness` / `ready_at` 目前保存在插件内存中，OpenCode 重启后 `ssh_job_status` 不再显示这两个字段；
 - 同一私钥的口令目前只能在重新选择私钥时更新；
 - `known_hosts` 仍是本地 JSON 文件，未迁移到 SQLite；

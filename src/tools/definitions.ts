@@ -22,7 +22,19 @@ import type {
 import { SshOperationError } from "../ssh/errors.js";
 import { InvalidGlobPatternError } from "../ssh/glob.js";
 import type { JobInfo, JobService } from "../ssh/jobs.js";
-import type { JobReadiness, WatchNotifier } from "../ssh/watch-notifier.js";
+import type {
+  JobReadiness,
+  WatchNotifier,
+  WatchSource,
+} from "../ssh/watch-notifier.js";
+import {
+  CompositeSource,
+  HealthSource,
+  LogSource,
+  PidSource,
+  TimeoutSource,
+  type WatchExec,
+} from "../ssh/watch-sources.js";
 import type {
   GlobResult,
   GrepResult,
@@ -550,7 +562,7 @@ const JOB_STOP_INPUT = {
   additionalProperties: false,
 } as const;
 
-const JOB_WATCH_INPUT = {
+const WATCH_INPUT = {
   type: "object",
   properties: {
     ssh_id: {
@@ -561,19 +573,38 @@ const JOB_WATCH_INPUT = {
     job_id: {
       type: "string",
       description:
-        "Existing job id returned by ssh_job_start. This tool reattaches notification only; it does not start or stop the job.",
+        "Existing job id returned by ssh_job_start. This reattaches notification only; it does not start or stop the job. Do not combine with generic pid/log/health conditions.",
     },
-    job_notify_log_lines: {
+    pid: {
       type: "integer",
-      minimum: 0,
-      maximum: 500,
+      minimum: 1,
       description:
-        "Number of output.log lines included in the notification. Defaults to the plugin setting.",
+        "Process id to watch. The watch reports pid-exited when kill -0 fails.",
+    },
+    pid_file: {
+      type: "string",
+      description:
+        "Remote file containing a pid. The watch reads it and then monitors the process.",
+    },
+    log_path: {
+      type: "string",
+      description:
+        "Remote log file. Used for success_regex/failure_regex and as the notification log tail.",
+    },
+    success_regex: {
+      type: "string",
+      description:
+        "Regex matched against the log tail. A match exits the watch with a success notification.",
+    },
+    failure_regex: {
+      type: "string",
+      description:
+        "Regex matched against the log tail. A match exits the watch with a failure notification.",
     },
     ready_command: {
       type: "string",
       description:
-        "Readiness probe for a service job. Exit code 0 means the service is ready.",
+        "Readiness probe command. Exit code 0 means the service is ready.",
     },
     ready_timeout_ms: {
       type: "integer",
@@ -599,8 +630,32 @@ const JOB_WATCH_INPUT = {
       description:
         "After the service is ready, keep watching for an unexpected exit and notify once more.",
     },
+    timeout_ms: {
+      type: "integer",
+      minimum: 1000,
+      maximum: 86400000,
+      description:
+        "Overall watch timeout. If no other terminal condition fires, notify timeout.",
+    },
+    notify: {
+      type: "boolean",
+      description:
+        "Register the watch (default true). Set false to validate conditions without creating a watch.",
+    },
+    notify_log_lines: {
+      type: "integer",
+      minimum: 0,
+      maximum: 500,
+      description:
+        "Number of log lines included in the notification. Defaults to the plugin setting.",
+    },
+    notify_session_id: {
+      type: "string",
+      description:
+        "Session to wake. Defaults to the current session; useful for parent/child session routing.",
+    },
   },
-  required: ["ssh_id", "job_id"],
+  required: ["ssh_id"],
   additionalProperties: false,
 } as const;
 
@@ -1681,86 +1736,221 @@ export function createSshTools(
     {
       name: "watch",
       description:
-        "Reattach a notification watch to an existing job, for example after ssh_connect created a new ssh_id. " +
-        "This does not start or stop the job; it only registers completion/readiness notification again. " +
-        "Use ssh_job_start for new jobs. If the job already finished, the watch notifies immediately on the next check.",
-      input: JOB_WATCH_INPUT,
+        "Register a notification watch. Use job_id to reattach an existing ssh_job_start job after reconnect; this does not start or stop the job. " +
+        "Use generic conditions for a process started outside job_start: pid or pid_file, log_path with success_regex/failure_regex, ready_command, or timeout_ms. " +
+        "The watch returns immediately and wakes this session when the condition reaches a terminal state.",
+      input: WATCH_INPUT,
       options: { namespace: "ssh", codemode: true },
       execute: async (raw, context) => {
         const input = asRecord(raw);
         const sshId = requireString(input.ssh_id, "ssh_id");
-        const jobId = requireString(input.job_id, "job_id");
         if (dependencies.watchNotifier === undefined) {
           throw new Error("Job notifications are not available in this plugin instance.");
         }
 
-        const info = await dependencies.jobs.status(sshId, jobId, 0);
-        if (Array.isArray(info)) {
-          throw new Error("Expected a single job status.");
+        const notify =
+          input.notify === undefined
+            ? true
+            : requireBoolean(input.notify, "notify");
+        if (!notify) {
+          return {
+            content: "Notification disabled; no watch registered.",
+            metadata: { notify: false },
+          };
         }
 
+        const jobId = optionalString(input.job_id);
+        const sessionID =
+          optionalString(input.notify_session_id) ?? context.sessionID;
+        const name = optionalString(input.name);
         const hostLabel = connectionLabel(dependencies.manager, sshId);
-        const watchId = dependencies.watchNotifier.watchJob({
-          sshId,
-          jobId,
-          sessionID: context.sessionID,
+        const logLines =
+          input.notify_log_lines === undefined
+            ? undefined
+            : requireInteger(input.notify_log_lines, "notify_log_lines");
+        const readyCommand = optionalString(input.ready_command);
+        const readyTimeoutMs =
+          input.ready_timeout_ms === undefined
+            ? undefined
+            : requireInteger(input.ready_timeout_ms, "ready_timeout_ms");
+        const readyIntervalMs =
+          input.ready_interval_ms === undefined
+            ? undefined
+            : requireInteger(input.ready_interval_ms, "ready_interval_ms");
+        const readyStableMs =
+          input.ready_stable_ms === undefined
+            ? undefined
+            : requireInteger(input.ready_stable_ms, "ready_stable_ms");
+        const watchAfterReady =
+          input.watch_after_ready === undefined
+            ? undefined
+            : requireBoolean(input.watch_after_ready, "watch_after_ready");
+        const pid =
+          input.pid === undefined
+            ? undefined
+            : requireInteger(input.pid, "pid");
+        const pidFile = optionalString(input.pid_file);
+        const logPath = optionalString(input.log_path);
+        const successRegex = optionalString(input.success_regex);
+        const failureRegex = optionalString(input.failure_regex);
+        const timeoutMs =
+          input.timeout_ms === undefined
+            ? undefined
+            : requireInteger(input.timeout_ms, "timeout_ms");
+
+        const hasGeneric =
+          pid !== undefined ||
+          pidFile !== undefined ||
+          logPath !== undefined ||
+          readyCommand !== undefined ||
+          timeoutMs !== undefined;
+
+        if (jobId !== undefined && hasGeneric) {
+          throw new Error(
+            "Use either job_id or generic pid/log/health conditions, not both.",
+          );
+        }
+        if (jobId !== undefined) {
+          const info = await dependencies.jobs.status(sshId, jobId, 0);
+          if (Array.isArray(info)) {
+            throw new Error("Expected a single job status.");
+          }
+
+          const watchId = dependencies.watchNotifier.watchJob({
+            sshId,
+            jobId,
+            sessionID,
+            agent: context.agent,
+            ...(info.name !== undefined ? { name: info.name } : {}),
+            ...(hostLabel !== undefined ? { hostLabel } : {}),
+            ...(logLines !== undefined ? { logLines } : {}),
+            ...(readyCommand !== undefined ? { readyCommand } : {}),
+            ...(readyTimeoutMs !== undefined ? { readyTimeoutMs } : {}),
+            ...(readyIntervalMs !== undefined ? { readyIntervalMs } : {}),
+            ...(readyStableMs !== undefined ? { readyStableMs } : {}),
+            ...(watchAfterReady !== undefined ? { watchAfterReady } : {}),
+          });
+
+          return {
+            content: [
+              `Watch registered: ${watchId}`,
+              `job_id: ${jobId}`,
+              `state: ${info.state}`,
+              "",
+              "This watch will notify this session when the job finishes, becomes ready, fails to start, or times out.",
+            ].join("\n"),
+            metadata: { watchId, jobId, state: info.state },
+          };
+        }
+
+        if (!hasGeneric) {
+          throw new Error(
+            "Provide job_id, pid/pid_file, log_path with a regex, ready_command, or timeout_ms.",
+          );
+        }
+        if (pid !== undefined && pidFile !== undefined) {
+          throw new Error("Use either pid or pid_file, not both.");
+        }
+        if (
+          watchAfterReady === true &&
+          pid === undefined &&
+          pidFile === undefined
+        ) {
+          throw new Error(
+            "watch_after_ready requires pid or pid_file for generic watches.",
+          );
+        }
+        if (
+          logPath !== undefined &&
+          successRegex === undefined &&
+          failureRegex === undefined &&
+          pid === undefined &&
+          pidFile === undefined &&
+          readyCommand === undefined
+        ) {
+          throw new Error(
+            "log_path requires success_regex or failure_regex when no pid/ready condition is provided.",
+          );
+        }
+
+        const exec: WatchExec = (args) => dependencies.manager.exec(args);
+        const sources: WatchSource[] = [];
+
+        if (pid !== undefined || pidFile !== undefined) {
+          sources.push(
+            new PidSource({
+              exec,
+              sshId,
+              ...(pid !== undefined ? { pid } : {}),
+              ...(pidFile !== undefined ? { pidFile } : {}),
+              ...(logPath !== undefined ? { logPath } : {}),
+              ...(logLines !== undefined ? { logLines } : {}),
+            }),
+          );
+        }
+        if (
+          logPath !== undefined &&
+          (successRegex !== undefined || failureRegex !== undefined)
+        ) {
+          sources.push(
+            new LogSource({
+              exec,
+              sshId,
+              logPath,
+              ...(successRegex !== undefined ? { successRegex } : {}),
+              ...(failureRegex !== undefined ? { failureRegex } : {}),
+              ...(logLines !== undefined ? { logLines } : {}),
+            }),
+          );
+        }
+        if (readyCommand !== undefined) {
+          sources.push(
+            new HealthSource({
+              exec,
+              sshId,
+              readyCommand,
+              ...(readyTimeoutMs !== undefined ? { readyTimeoutMs } : {}),
+              ...(readyIntervalMs !== undefined ? { readyIntervalMs } : {}),
+              ...(readyStableMs !== undefined ? { readyStableMs } : {}),
+              ...(logPath !== undefined ? { logPath } : {}),
+              ...(logLines !== undefined ? { logLines } : {}),
+            }),
+          );
+        }
+        if (timeoutMs !== undefined) {
+          sources.push(new TimeoutSource(timeoutMs));
+        }
+
+        const source =
+          sources.length === 1
+            ? sources[0]!
+            : new CompositeSource(sources);
+        const watchId = dependencies.watchNotifier.watch({
+          source,
+          sessionID,
           agent: context.agent,
-          ...(info.name !== undefined ? { name: info.name } : {}),
+          ...(name !== undefined ? { name } : {}),
           ...(hostLabel !== undefined ? { hostLabel } : {}),
-          ...(input.job_notify_log_lines !== undefined
-            ? {
-                logLines: requireInteger(
-                  input.job_notify_log_lines,
-                  "job_notify_log_lines",
-                ),
-              }
-            : {}),
-          ...(input.ready_command !== undefined
-            ? { readyCommand: requireString(input.ready_command, "ready_command") }
-            : {}),
-          ...(input.ready_timeout_ms !== undefined
-            ? {
-                readyTimeoutMs: requireInteger(
-                  input.ready_timeout_ms,
-                  "ready_timeout_ms",
-                ),
-              }
-            : {}),
-          ...(input.ready_interval_ms !== undefined
-            ? {
-                readyIntervalMs: requireInteger(
-                  input.ready_interval_ms,
-                  "ready_interval_ms",
-                ),
-              }
-            : {}),
-          ...(input.ready_stable_ms !== undefined
-            ? {
-                readyStableMs: requireInteger(
-                  input.ready_stable_ms,
-                  "ready_stable_ms",
-                ),
-              }
-            : {}),
-          ...(input.watch_after_ready !== undefined
-            ? {
-                watchAfterReady: requireBoolean(
-                  input.watch_after_ready,
-                  "watch_after_ready",
-                ),
-              }
-            : {}),
+          ...(logLines !== undefined ? { logLines } : {}),
+          ...(watchAfterReady !== undefined ? { watchAfterReady } : {}),
         });
 
         return {
           content: [
             `Watch registered: ${watchId}`,
-            `job_id: ${jobId}`,
-            `state: ${info.state}`,
+            `conditions: ${describeWatchConditions({
+              ...(pid !== undefined ? { pid } : {}),
+              ...(pidFile !== undefined ? { pidFile } : {}),
+              ...(logPath !== undefined ? { logPath } : {}),
+              ...(successRegex !== undefined ? { successRegex } : {}),
+              ...(failureRegex !== undefined ? { failureRegex } : {}),
+              ...(readyCommand !== undefined ? { readyCommand } : {}),
+              ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+            })}`,
             "",
-            "This watch will notify this session when the job finishes, becomes ready, fails to start, or times out.",
+            "This watch will notify this session when the condition is met.",
           ].join("\n"),
-          metadata: { watchId, jobId, state: info.state },
+          metadata: { watchId },
         };
       },
     },
@@ -2194,6 +2384,34 @@ async function assertHostPermission(
     toolCallID: context.id,
     resource: `${connection.user}@${connection.host}:${connection.port}`,
   });
+}
+
+function describeWatchConditions(input: {
+  pid?: number;
+  pidFile?: string;
+  logPath?: string;
+  successRegex?: string;
+  failureRegex?: string;
+  readyCommand?: string;
+  timeoutMs?: number;
+}): string {
+  const parts: string[] = [];
+  if (input.pid !== undefined) parts.push(`pid=${input.pid}`);
+  if (input.pidFile !== undefined) parts.push(`pid_file=${input.pidFile}`);
+  if (input.logPath !== undefined) parts.push(`log=${input.logPath}`);
+  if (input.successRegex !== undefined) {
+    parts.push(`success_regex=${input.successRegex}`);
+  }
+  if (input.failureRegex !== undefined) {
+    parts.push(`failure_regex=${input.failureRegex}`);
+  }
+  if (input.readyCommand !== undefined) {
+    parts.push(`ready_command=${input.readyCommand}`);
+  }
+  if (input.timeoutMs !== undefined) {
+    parts.push(`timeout_ms=${input.timeoutMs}`);
+  }
+  return parts.length > 0 ? parts.join(", ") : "(none)";
 }
 
 function connectionLabel(

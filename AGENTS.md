@@ -101,8 +101,10 @@ Use the job tools when a task should outlive one tool call (training, builds, mi
 - Pass `job_notify: false` for fire-and-forget jobs. Do not create notification noise when the user does not need the result.
 - For services (vLLM, backend, daemon), pass `ready_command`. The job stays running after the `ready` notification; use `ssh_job_stop` when it should be stopped.
 - `ssh_exec` only sees the launcher exit. If a command self-detaches (`nohup ... &`, `docker run -d`), it is not tracked and produces no notification. Use `ssh_job_start` for long tasks.
-- After reconnect or OpenCode restart, reattach with `ssh_watch({ ssh_id, job_id })`; this only re-registers notification. Never call `ssh_job_start` again for the same job, or a second job is created.
-- v1 `ssh_watch` supports existing `job_id` only; generic pid/log/health watches are not implemented yet.
+- After reconnect or OpenCode restart, reattach a job with `ssh_watch({ ssh_id, job_id })`; this only re-registers notification. Never call `ssh_job_start` again for the same job, or a second job is created.
+- For work that `ssh_exec` started and detached (`nohup ... &`, `docker run -d`), use `ssh_watch` with a `pid`/`pid_file`, `log_path` + success/failure regex, `ready_command`, and/or `timeout_ms`. `ssh_exec` itself does not track or notify for detached work.
+- `ssh_watch` with `watch_after_ready: true` requires `pid` or `pid_file`; health alone cannot detect a later crash.
+- `ssh_unwatch({ watch_id })` cancels notification only; it does not stop the task. `ssh_watch_list()` lists active watches.
 
 ## Security
 
