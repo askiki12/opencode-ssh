@@ -50,6 +50,15 @@
   - 当前 `ssh_job_status` 的 `readiness` / `ready_at` 来自内存中的 `WatchNotifier`，插件重启后丢失。
   - 预期：ready 时写 `ready_at`，timeout/failed 时写 `ready_timeout_at` / `ready_failed_at`，由 `JobService.status` 读取。
 
+- [ ] **suspended watch 自动重建 / profileId 重连**
+  - 当前 OpenCode 重启后只把 watch 展示为 suspended，需要 agent 手动 `ssh_watch({ job_id })` 或按 conditions 重新调用 `ssh_watch`。
+  - 预期：持久化 `profileId`/host，启动或 `ssh_connect` 后按 profile 重连并自动重建 JobSource；通用 watch 需先验证 pid/log/health 仍有效，再重建。
+  - 可选：`ssh_watch({ watch_id })` 按持久化 descriptor 重建通用 watch。
+
+- [ ] **多 job debounce / 多 OpenCode 实例协调**
+  - 多个 job 同时结束会各自唤醒会话；可做 1～2 秒 debounce 合并同一 session 的通知。
+  - 同一远端用户的多个 OpenCode 实例共享 job 目录，可能重复 watch/通知；需要 owner/lock/清理约定。
+
 - [ ] **Phase 2：SSH 反向隧道任务回调（可选）**
   - 现状：已完成 watcher 轮询 + `session.synthetic`，覆盖 job 退出、服务 ready/failed/timeout、通用 pid/log/health。
   - 目标：任务退出时由远端主动回调，降低通知延迟（不用等 5～30 秒轮询），减少大量短任务/安静任务的 SSH 轮询。

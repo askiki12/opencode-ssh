@@ -1931,6 +1931,15 @@ async function main() {
     };
     assert.match(formatJobNotice(genericReady), /终止对应进程/);
     assert.doesNotMatch(formatJobNotice(genericReady), /ssh_job_stop/);
+    const genericTimeout: JobNotice = {
+      event: "timeout",
+      kind: "timeout",
+      watchId: "watch_timeout",
+      sessionID: "ses_generic",
+      state: "running",
+    };
+    assert.match(formatJobNotice(genericTimeout), /\[ssh watch: timeout\]/);
+    assert.doesNotMatch(formatJobNotice(genericTimeout), /就绪/);
     notifier.dispose();
   }
 

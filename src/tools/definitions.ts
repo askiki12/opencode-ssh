@@ -570,6 +570,10 @@ const WATCH_INPUT = {
       description:
         "Connection id returned by ssh_connect. A new connection can reattach to an existing job after reconnect.",
     },
+    name: {
+      type: "string",
+      description: "Optional short label shown in notifications and watch lists.",
+    },
     job_id: {
       type: "string",
       description:
