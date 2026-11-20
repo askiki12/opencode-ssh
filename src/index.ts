@@ -9,6 +9,7 @@ import { createRpcHandlers } from "./rpc-handlers.js";
 import { ConnectionManager } from "./ssh/manager.js";
 import { JobService } from "./ssh/jobs.js";
 import { SearchService } from "./ssh/search.js";
+import { formatJobNotice, WatchNotifier } from "./ssh/watch-notifier.js";
 import { createSshTools } from "./tools/definitions.js";
 
 export default Plugin.define({
@@ -26,6 +27,56 @@ export default Plugin.define({
     const manager = new ConnectionManager(config, profiles, knownHosts);
     const search = new SearchService(manager);
     const jobs = new JobService(manager);
+    const watchNotifier = new WatchNotifier({
+      jobs,
+      logLines: config.jobNotifyLogLines,
+      initialIntervalMs: config.jobNotifyIntervalMs,
+      readyIntervalMs: config.jobReadyIntervalMs,
+      readyTimeoutMs: config.jobReadyTimeoutMs,
+      readyStableMs: config.jobReadyStableMs,
+      watchAfterReady: config.jobWatchAfterReady,
+      runProbe: async ({ sshId, jobDir, command, timeoutMs }) => {
+        try {
+          const result = await manager.exec({
+            sshId,
+            command,
+            cwd: jobDir,
+            timeoutMs,
+            maxOutputBytes: 8 * 1024,
+          });
+          return result.exitCode === 0;
+        } catch {
+          return false;
+        }
+      },
+      notify: async (notice) => {
+        await ctx.session.synthetic({
+          sessionID: notice.sessionID as never,
+          text: formatJobNotice(notice),
+          description:
+            notice.event === "ready"
+              ? "SSH service ready"
+              : notice.event === "timeout"
+                ? "SSH service timeout"
+                : notice.event === "service-exited"
+                  ? "SSH service exited"
+                  : notice.event === "monitor-stopped"
+                    ? "SSH job monitor stopped"
+                    : "SSH job finished",
+          resume: true,
+          delivery: "queue",
+          metadata: {
+            source: "opencode-ssh",
+            jobId: notice.jobId,
+            state: notice.state,
+            event: notice.event,
+            ...(notice.readiness !== undefined
+              ? { readiness: notice.readiness }
+              : {}),
+          },
+        });
+      },
+    });
     const rpcRegistration = await ctx.rpc.register(
       SshRpc,
       createRpcHandlers({ manager, profiles }),
@@ -36,6 +87,7 @@ export default Plugin.define({
       config,
       search,
       jobs,
+      watchNotifier,
       assertPermission: async (request) => {
         await ctx.permission.assert({
           // The plugin tool context carries branded ids. They are strings at
@@ -66,6 +118,7 @@ export default Plugin.define({
 
     return async () => {
       try {
+        watchNotifier.dispose();
         await registration.dispose();
       } finally {
         try {

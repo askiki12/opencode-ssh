@@ -41,6 +41,15 @@
 
 ### P2（低优先级）
 
+- [ ] **通用 WatchSource（pid / log / health）**
+  - v1 只支持 `ssh_job_start` 的完成/就绪通知，以及 `ssh_watch({ ssh_id, job_id })` 重连后 reattach。
+  - 下一步扩展 `ssh_watch`：pid / pid_file、日志成功/失败正则、`ready_command`、timeout；复用现有 `WatchNotifier` 核心，不另写通知/去重逻辑。
+  - 主要面向 `ssh_exec` 自 detach 的任务、已有 daemon、外部服务。
+
+- [ ] **readiness 标记持久化**
+  - 当前 `ssh_job_status` 的 `readiness` / `ready_at` 来自内存中的 `WatchNotifier`，插件重启后丢失。
+  - 预期：ready 时写 `ready_at`，timeout/failed 时写 `ready_timeout_at` / `ready_failed_at`，由 `JobService.status` 读取。
+
 - [ ] **`fleet_exec`：多机并发执行**
   - 价值：一次调用替代 N 次工具调用；并发上限、`stop_on_error`、rolling 分批、每台独立结果；按 tag 选择可减少提示体积。
   - 前置：profile 目前没有 tag/分组，需要扩展数据模型和 UI。
@@ -102,6 +111,7 @@
 
 ## 已完成
 
+- 2026-11-20：v1 job 通知（分支 `feat/job-notifications`）：`WatchNotifier` + `JobSource`；`ssh_job_start` 默认注册完成/就绪通知，支持 `job_notify`、`job_notify_log_lines`、`ready_command`、`ready_timeout_ms`、`ready_interval_ms`、`ready_stable_ms`、`watch_after_ready`；终态通过 `session.synthetic({ resume: true })` 唤醒会话；新增 `ssh_watch({ ssh_id, job_id })` 用于重连后 reattach，以及 `ssh_unwatch` / `ssh_watch_list`；`ssh_exec` 描述明确自 detach 不追踪。readiness 状态暂存内存，持久化待后续。
 - 2026-11：7 个工具（connect / disconnect / list / exec / profile_add / profile_update / profile_remove / profile_list）实现完毕。
 - 2026-11：profile 迁移到 `ctx.storage`（SQLite），移除 `profiles.json`。
 - 2026-11：密码、私钥口令、sudo 密码使用 AES-256-GCM 加密；活跃连接和 sudo 密码仅保存在内存。

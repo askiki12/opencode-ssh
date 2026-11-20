@@ -17,6 +17,20 @@ export interface SshPluginOptions {
   keepaliveIntervalMs?: number;
   /** Default policy for unknown host keys. */
   hostKeyPolicy?: HostKeyPolicy;
+  /** Notify the session when a job finishes, becomes ready, or times out. */
+  jobNotify?: boolean;
+  /** Initial interval for job status checks. */
+  jobNotifyIntervalMs?: number;
+  /** Number of output.log lines included in job notifications. */
+  jobNotifyLogLines?: number;
+  /** Default readiness probe interval for service jobs. */
+  jobReadyIntervalMs?: number;
+  /** Default time allowed for a service job to become ready. */
+  jobReadyTimeoutMs?: number;
+  /** Time a readiness probe must stay successful before the job is ready. */
+  jobReadyStableMs?: number;
+  /** Default: keep watching a ready service for an unexpected exit. */
+  jobWatchAfterReady?: boolean;
 }
 
 export interface ResolvedConfig {
@@ -27,6 +41,13 @@ export interface ResolvedConfig {
   execTimeoutMs: number;
   keepaliveIntervalMs: number;
   hostKeyPolicy: HostKeyPolicy;
+  jobNotify: boolean;
+  jobNotifyIntervalMs: number;
+  jobNotifyLogLines: number;
+  jobReadyIntervalMs: number;
+  jobReadyTimeoutMs: number;
+  jobReadyStableMs: number;
+  jobWatchAfterReady: boolean;
 }
 
 const POLICIES: ReadonlySet<string> = new Set(["accept-new", "strict", "insecure"]);
@@ -81,6 +102,43 @@ export function resolveConfig(
       10 * 60 * 1000,
     ),
     hostKeyPolicy: hostKeyPolicy as HostKeyPolicy,
+    jobNotify: booleanOption(options, "jobNotify", true),
+    jobNotifyIntervalMs: numberOption(
+      options,
+      "jobNotifyIntervalMs",
+      5_000,
+      500,
+      5 * 60 * 1000,
+    ),
+    jobNotifyLogLines: numberOption(
+      options,
+      "jobNotifyLogLines",
+      40,
+      0,
+      500,
+    ),
+    jobReadyIntervalMs: numberOption(
+      options,
+      "jobReadyIntervalMs",
+      5_000,
+      500,
+      5 * 60 * 1000,
+    ),
+    jobReadyTimeoutMs: numberOption(
+      options,
+      "jobReadyTimeoutMs",
+      20 * 60 * 1000,
+      1_000,
+      24 * 60 * 60 * 1000,
+    ),
+    jobReadyStableMs: numberOption(
+      options,
+      "jobReadyStableMs",
+      5_000,
+      0,
+      10 * 60 * 1000,
+    ),
+    jobWatchAfterReady: booleanOption(options, "jobWatchAfterReady", false),
   };
 }
 
@@ -114,6 +172,15 @@ function stringOption(
   return typeof value === "string" && value.trim().length > 0
     ? value.trim()
     : undefined;
+}
+
+function booleanOption(
+  options: Readonly<Record<string, unknown>>,
+  key: string,
+  fallback: boolean,
+): boolean {
+  const value = options[key];
+  return typeof value === "boolean" ? value : fallback;
 }
 
 function numberOption(

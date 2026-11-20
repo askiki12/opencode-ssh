@@ -95,6 +95,15 @@ Use the job tools when a task should outlive one tool call (training, builds, mi
 - Only the **host process** is tracked. Containers keep their own lifecycle: stopping a job may leave the container running, so decide separately whether to stop or keep it (`docker ps`, `docker stop`).
 - POSIX remotes only.
 
+## Job notifications
+
+- `ssh_job_start` registers a completion/readiness notification by default. Do not poll `ssh_job_status` just to wait; the session is woken when the job finishes, becomes ready, fails to start, or times out.
+- Pass `job_notify: false` for fire-and-forget jobs. Do not create notification noise when the user does not need the result.
+- For services (vLLM, backend, daemon), pass `ready_command`. The job stays running after the `ready` notification; use `ssh_job_stop` when it should be stopped.
+- `ssh_exec` only sees the launcher exit. If a command self-detaches (`nohup ... &`, `docker run -d`), it is not tracked and produces no notification. Use `ssh_job_start` for long tasks.
+- After reconnect or OpenCode restart, reattach with `ssh_watch({ ssh_id, job_id })`; this only re-registers notification. Never call `ssh_job_start` again for the same job, or a second job is created.
+- v1 `ssh_watch` supports existing `job_id` only; generic pid/log/health watches are not implemented yet.
+
 ## Security
 
 - Do not put passwords, private key passphrases, or sudo passwords in user-facing summaries.

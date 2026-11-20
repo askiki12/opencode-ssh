@@ -22,6 +22,7 @@ import type {
 import { SshOperationError } from "../ssh/errors.js";
 import { InvalidGlobPatternError } from "../ssh/glob.js";
 import type { JobInfo, JobService } from "../ssh/jobs.js";
+import type { JobReadiness, WatchNotifier } from "../ssh/watch-notifier.js";
 import type {
   GlobResult,
   GrepResult,
@@ -54,6 +55,7 @@ export interface ToolDependencies {
   config: ResolvedConfig;
   search: SearchService;
   jobs: JobService;
+  watchNotifier?: WatchNotifier;
   assertPermission?: (request: SshPermissionRequest) => Promise<void>;
 }
 
@@ -460,6 +462,49 @@ const JOB_START_INPUT = {
       description:
         "Working directory for the command. Absolute or ~/...; defaults to the remote home directory.",
     },
+    job_notify: {
+      type: "boolean",
+      description:
+        "Notify this session when the job finishes, becomes ready, or times out. Defaults to the plugin jobNotify setting.",
+    },
+    job_notify_log_lines: {
+      type: "integer",
+      minimum: 0,
+      maximum: 500,
+      description:
+        "Number of output.log lines included in the notification. Defaults to the plugin setting.",
+    },
+    ready_command: {
+      type: "string",
+      description:
+        "Readiness probe for a service job. Exit code 0 means the service is ready. Example: curl -fsS -m 3 http://127.0.0.1:8000/health.",
+    },
+    ready_timeout_ms: {
+      type: "integer",
+      minimum: 1000,
+      maximum: 86400000,
+      description:
+        "How long to wait for ready_command before notifying timeout. Defaults to 20 minutes.",
+    },
+    ready_interval_ms: {
+      type: "integer",
+      minimum: 500,
+      maximum: 300000,
+      description:
+        "Readiness probe interval. Defaults to 5 seconds.",
+    },
+    ready_stable_ms: {
+      type: "integer",
+      minimum: 0,
+      maximum: 600000,
+      description:
+        "How long readiness must stay successful before the service is considered ready. Defaults to 5 seconds and at least two successful probes.",
+    },
+    watch_after_ready: {
+      type: "boolean",
+      description:
+        "After the service is ready, keep watching for an unexpected exit and notify once more.",
+    },
   },
   required: ["ssh_id", "command"],
   additionalProperties: false,
@@ -502,6 +547,72 @@ const JOB_STOP_INPUT = {
     },
   },
   required: ["ssh_id", "job_id"],
+  additionalProperties: false,
+} as const;
+
+const JOB_WATCH_INPUT = {
+  type: "object",
+  properties: {
+    ssh_id: {
+      type: "string",
+      description:
+        "Connection id returned by ssh_connect. A new connection can reattach to an existing job after reconnect.",
+    },
+    job_id: {
+      type: "string",
+      description:
+        "Existing job id returned by ssh_job_start. This tool reattaches notification only; it does not start or stop the job.",
+    },
+    job_notify_log_lines: {
+      type: "integer",
+      minimum: 0,
+      maximum: 500,
+      description:
+        "Number of output.log lines included in the notification. Defaults to the plugin setting.",
+    },
+    ready_command: {
+      type: "string",
+      description:
+        "Readiness probe for a service job. Exit code 0 means the service is ready.",
+    },
+    ready_timeout_ms: {
+      type: "integer",
+      minimum: 1000,
+      maximum: 86400000,
+      description: "How long to wait for ready_command before notifying timeout.",
+    },
+    ready_interval_ms: {
+      type: "integer",
+      minimum: 500,
+      maximum: 300000,
+      description: "Readiness probe interval.",
+    },
+    ready_stable_ms: {
+      type: "integer",
+      minimum: 0,
+      maximum: 600000,
+      description:
+        "How long readiness must stay successful before the service is considered ready.",
+    },
+    watch_after_ready: {
+      type: "boolean",
+      description:
+        "After the service is ready, keep watching for an unexpected exit and notify once more.",
+    },
+  },
+  required: ["ssh_id", "job_id"],
+  additionalProperties: false,
+} as const;
+
+const JOB_UNWATCH_INPUT = {
+  type: "object",
+  properties: {
+    watch_id: {
+      type: "string",
+      description: "Watch id returned by ssh_job_start or ssh_watch.",
+    },
+  },
+  required: ["watch_id"],
   additionalProperties: false,
 } as const;
 
@@ -763,6 +874,7 @@ export function createSshTools(
         "Each call opens a new channel, so shell state such as cd/export does not persist; use cwd and env instead. " +
         "tty=true allocates a PTY but does not provide interactive stdin; stdin closes immediately, so use it for TTY detection/color, not for prompts. " +
         "Background processes inherit the SSH channel's stdout/stderr; if they outlive this call they can hit EPIPE/SIGPIPE or SIGHUP. Redirect stdin/stdout/stderr and detach, or use ssh_job_start. " +
+        "If the command detaches work itself (nohup ... &, docker run -d, start /b) and exits, this tool only sees the launcher exit; it does not track the background process and does not register a completion notification. Use ssh_job_start for tracked long tasks. " +
         "Set sudo=true to run through sudo, or as_user to switch users. " +
         "sudo uses the sudo password stored on the connection; the password is written to sudo's stdin, never to the command line. " +
         "The tool does not pre-check sudo: a missing password may still work (NOPASSWD) or fail, and a wrong password is only visible in exit_code/stderr. " +
@@ -1377,6 +1489,8 @@ export function createSshTools(
         "Run a foreground command. Scripts that fan out and wait (for example `&` + `wait`) are fine. Avoid commands that return immediately and leave detached work behind (for example `nohup cmd &`): the job tracks only the launcher; use ssh_exec for those. " +
         "Only the host process is tracked; containers keep their own lifecycle. " +
         "Cancelling this call does not stop the job; with setsid, disconnecting does not either. Use ssh_job_stop to terminate it. " +
+        "By default the job registers a completion notification; pass job_notify=false for fire-and-forget jobs. " +
+        "For a service that stays running, set ready_command so the session is notified when it is ready, fails to start, or times out. " +
         "Inspect with ssh_job_status and clean up with ssh_remove on job_dir. POSIX remotes only.",
       input: JOB_START_INPUT,
       options: { namespace: "ssh", codemode: true },
@@ -1396,6 +1510,60 @@ export function createSshTools(
             : {}),
         });
 
+        const notify =
+          input.job_notify === undefined
+            ? dependencies.config.jobNotify
+            : input.job_notify === true;
+        const hostLabel = connectionLabel(dependencies.manager, sshId);
+        if (notify && dependencies.watchNotifier !== undefined) {
+          dependencies.watchNotifier.watchJob({
+            sshId,
+            jobId: result.jobId,
+            sessionID: context.sessionID,
+            agent: context.agent,
+            ...(result.name !== undefined ? { name: result.name } : {}),
+            ...(hostLabel !== undefined ? { hostLabel } : {}),
+            ...(input.job_notify_log_lines !== undefined
+              ? {
+                  logLines: requireInteger(
+                    input.job_notify_log_lines,
+                    "job_notify_log_lines",
+                  ),
+                }
+              : {}),
+            ...(input.ready_command !== undefined
+              ? { readyCommand: requireString(input.ready_command, "ready_command") }
+              : {}),
+            ...(input.ready_timeout_ms !== undefined
+              ? {
+                  readyTimeoutMs: requireInteger(
+                    input.ready_timeout_ms,
+                    "ready_timeout_ms",
+                  ),
+                }
+              : {}),
+            ...(input.ready_interval_ms !== undefined
+              ? {
+                  readyIntervalMs: requireInteger(
+                    input.ready_interval_ms,
+                    "ready_interval_ms",
+                  ),
+                }
+              : {}),
+            ...(input.ready_stable_ms !== undefined
+              ? {
+                  readyStableMs: requireInteger(
+                    input.ready_stable_ms,
+                    "ready_stable_ms",
+                  ),
+                }
+              : {}),
+            ...(input.watch_after_ready !== undefined
+              ? { watchAfterReady: requireBoolean(input.watch_after_ready, "watch_after_ready") }
+              : {}),
+          });
+        }
+
         return {
           content: [
             `Job started: ${result.jobId}`,
@@ -1404,9 +1572,12 @@ export function createSshTools(
             `job_dir: ${result.jobDir}`,
             `log: ${result.logPath}`,
             "",
+            notify
+              ? "This job will notify this session automatically when it finishes, becomes ready, fails to start, or times out."
+              : "Notification disabled. Use ssh_job_status to check progress.",
             "Use ssh_job_status to check progress and ssh_job_stop to terminate it.",
           ].join("\n"),
-          metadata: { ...result },
+          metadata: { ...result, notify },
         };
       },
     },
@@ -1436,14 +1607,24 @@ export function createSshTools(
             metadata: { count: result.length },
           };
         }
+        const readiness = dependencies.watchNotifier?.describe(
+          sshId,
+          result.jobId,
+        );
         return {
-          content: formatJobInfo(result),
+          content: formatJobInfo(result, readiness),
           metadata: {
             jobId: result.jobId,
             state: result.state,
             pid: result.pid,
             exitCode: result.exitCode,
             jobDir: result.jobDir,
+            ...(readiness?.readiness !== undefined
+              ? { readiness: readiness.readiness }
+              : {}),
+            ...(readiness?.readyAt !== undefined
+              ? { readyAt: readiness.readyAt }
+              : {}),
           },
         };
       },
@@ -1494,6 +1675,141 @@ export function createSshTools(
           content: lines.join("\n"),
           metadata: { ...result },
         };
+      },
+    },
+
+    {
+      name: "watch",
+      description:
+        "Reattach a notification watch to an existing job, for example after ssh_connect created a new ssh_id. " +
+        "This does not start or stop the job; it only registers completion/readiness notification again. " +
+        "Use ssh_job_start for new jobs. If the job already finished, the watch notifies immediately on the next check.",
+      input: JOB_WATCH_INPUT,
+      options: { namespace: "ssh", codemode: true },
+      execute: async (raw, context) => {
+        const input = asRecord(raw);
+        const sshId = requireString(input.ssh_id, "ssh_id");
+        const jobId = requireString(input.job_id, "job_id");
+        if (dependencies.watchNotifier === undefined) {
+          throw new Error("Job notifications are not available in this plugin instance.");
+        }
+
+        const info = await dependencies.jobs.status(sshId, jobId, 0);
+        if (Array.isArray(info)) {
+          throw new Error("Expected a single job status.");
+        }
+
+        const hostLabel = connectionLabel(dependencies.manager, sshId);
+        const watchId = dependencies.watchNotifier.watchJob({
+          sshId,
+          jobId,
+          sessionID: context.sessionID,
+          agent: context.agent,
+          ...(info.name !== undefined ? { name: info.name } : {}),
+          ...(hostLabel !== undefined ? { hostLabel } : {}),
+          ...(input.job_notify_log_lines !== undefined
+            ? {
+                logLines: requireInteger(
+                  input.job_notify_log_lines,
+                  "job_notify_log_lines",
+                ),
+              }
+            : {}),
+          ...(input.ready_command !== undefined
+            ? { readyCommand: requireString(input.ready_command, "ready_command") }
+            : {}),
+          ...(input.ready_timeout_ms !== undefined
+            ? {
+                readyTimeoutMs: requireInteger(
+                  input.ready_timeout_ms,
+                  "ready_timeout_ms",
+                ),
+              }
+            : {}),
+          ...(input.ready_interval_ms !== undefined
+            ? {
+                readyIntervalMs: requireInteger(
+                  input.ready_interval_ms,
+                  "ready_interval_ms",
+                ),
+              }
+            : {}),
+          ...(input.ready_stable_ms !== undefined
+            ? {
+                readyStableMs: requireInteger(
+                  input.ready_stable_ms,
+                  "ready_stable_ms",
+                ),
+              }
+            : {}),
+          ...(input.watch_after_ready !== undefined
+            ? {
+                watchAfterReady: requireBoolean(
+                  input.watch_after_ready,
+                  "watch_after_ready",
+                ),
+              }
+            : {}),
+        });
+
+        return {
+          content: [
+            `Watch registered: ${watchId}`,
+            `job_id: ${jobId}`,
+            `state: ${info.state}`,
+            "",
+            "This watch will notify this session when the job finishes, becomes ready, fails to start, or times out.",
+          ].join("\n"),
+          metadata: { watchId, jobId, state: info.state },
+        };
+      },
+    },
+
+    {
+      name: "unwatch",
+      description:
+        "Cancel a notification watch by watch_id. This only stops notifications; it does not stop the job or remote process.",
+      input: JOB_UNWATCH_INPUT,
+      options: { namespace: "ssh", codemode: true },
+      execute: async (raw) => {
+        const input = asRecord(raw);
+        const watchId = requireString(input.watch_id, "watch_id");
+        if (dependencies.watchNotifier === undefined) {
+          throw new Error("Job notifications are not available in this plugin instance.");
+        }
+        const removed = dependencies.watchNotifier.unwatch(watchId);
+        return {
+          content: removed
+            ? `Watch canceled: ${watchId}`
+            : `No active watch found: ${watchId}`,
+          metadata: { watchId, removed },
+        };
+      },
+    },
+
+    {
+      name: "watch_list",
+      description:
+        "List active notification watches (job_id, session, readiness, start time). It does not list jobs or remote processes.",
+      input: LIST_INPUT,
+      options: { namespace: "ssh", codemode: true },
+      execute: async () => {
+        if (dependencies.watchNotifier === undefined) {
+          return { content: "No active watches." };
+        }
+        const watches = dependencies.watchNotifier.list();
+        if (watches.length === 0) return { content: "No active watches." };
+        const lines = [`watches: ${watches.length}`];
+        for (const watch of watches) {
+          const bits = [watch.watchId, watch.jobId, `session=${watch.sessionID}`];
+          if (watch.readiness !== undefined) {
+            bits.push(`readiness=${watch.readiness}`);
+          }
+          if (watch.name !== undefined) bits.push(`name=${watch.name}`);
+          if (watch.hostLabel !== undefined) bits.push(watch.hostLabel);
+          lines.push(`- ${bits.join("  ")}`);
+        }
+        return { content: lines.join("\n") };
       },
     },
 
@@ -1880,11 +2196,32 @@ async function assertHostPermission(
   });
 }
 
-function formatJobInfo(info: JobInfo): string {
+function connectionLabel(
+  manager: ConnectionManager,
+  sshId: string,
+): string | undefined {
+  try {
+    const info = manager.getInfo(sshId);
+    return `${info.user}@${info.host}:${info.port}`;
+  } catch {
+    return undefined;
+  }
+}
+
+function formatJobInfo(
+  info: JobInfo,
+  readiness?: { readiness?: JobReadiness; readyAt?: number },
+): string {
   const lines = [
     `job: ${info.jobId}`,
     ...(info.name !== undefined ? [`name: ${info.name}`] : []),
     `state: ${info.state}`,
+    ...(readiness?.readiness !== undefined
+      ? [`readiness: ${readiness.readiness}`]
+      : []),
+    ...(readiness?.readyAt !== undefined
+      ? [`ready_at: ${new Date(readiness.readyAt).toISOString()}`]
+      : []),
     ...(info.pid !== undefined ? [`pid: ${info.pid}`] : []),
     `exit_code: ${info.exitCode === undefined ? "(none)" : info.exitCode}`,
     ...(info.startedAt !== undefined ? [`started_at: ${info.startedAt}`] : []),

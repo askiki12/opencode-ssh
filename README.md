@@ -33,6 +33,7 @@ src/ssh/manager.ts            持久连接池、连接/断开/执行、取消与
 src/ssh/files.ts              SFTP 文件读写、编辑、删除、传输
 src/ssh/search.ts             远端 glob/grep 与引擎回退
 src/ssh/jobs.ts               远端长任务注册表与进程组停止
+src/ssh/watch-notifier.ts     job 完成/就绪通知与 synthetic 唤醒
 src/tools/definitions.ts      工具定义与返回格式化
 src/rpc.ts                    TUI 与 server 之间的 RPC 契约
 src/rpc-handlers.ts           RPC 实现（连接测试、profile 测试后再保存）
@@ -341,9 +342,12 @@ sudo 示例（需要 profile 或连接上保存了 `sudo_password`）：
 
 | 工具 | 用途 |
 | --- | --- |
-| `ssh_job_start` | 后台启动命令，立即返回 `job_id`、pid、job 目录和日志路径 |
+| `ssh_job_start` | 后台启动命令，立即返回 `job_id`、pid、job 目录和日志路径；默认注册完成/就绪通知 |
 | `ssh_job_status` | 查询单个 job；省略 `job_id` 时列出最近 100 个 job；`log_lines` 取日志尾部 |
 | `ssh_job_stop` | 先 `SIGTERM`，宽限后 `SIGKILL`，按进程组终止 |
+| `ssh_watch` | 重连后把已有 `job_id` 重新挂上通知；v1 只支持 job 模式 |
+| `ssh_unwatch` | 取消一个通知 watch，不停止任务 |
+| `ssh_watch_list` | 列出活跃的通知 watch |
 
 状态：
 
@@ -371,6 +375,56 @@ sudo 示例（需要 profile 或连接上保存了 `sudo_password`）：
 - `ssh_job_start` 以 SSH 登录用户运行，没有 `sudo` / `as_user` 参数，也不会使用连接上保存的 sudo 密码；需要特权时使用 NOPASSWD 或 `ssh_exec`；
 - 在支持 `setsid` 的远端（大多数 Linux/BSD），job 的生命周期独立于工具调用和 SSH 连接；没有 `setsid`（例如基础 macOS）时只能尽力 detach，断开连接可能终止进程。取消 `ssh_exec` 不会停止 job；检测用 `ssh_job_status`，停止用 `ssh_job_stop`，不需要额外的 `job_kill`；
 - **只跟踪宿主机进程**：容器有独立生命周期。`docker run -d` 会立刻返回，`docker exec` 不随 job 停止，停止 job 也可能留下容器；是否继续或停止容器需另外决定（`docker ps` / `docker stop`）。
+
+#### 2.10.1 完成与就绪自动通知
+
+`ssh_job_start` 默认会为 job 注册通知；任务进入终态后，插件通过 OpenCode 的 synthetic 消息唤醒当前会话，agent 不需要主动轮询。
+
+触发事件：
+
+- 进程退出：`finished` / `stopped` / `lost` / `corrupt`，通知带退出码和日志尾部；
+- 服务就绪：提供 `ready_command` 时，探测连续成功并稳定后通知 `ready`，job 继续运行；
+- 启动失败：就绪前进程退出，通知 `failed`；
+- 启动超时：超过 `ready_timeout_ms` 仍未就绪，通知 `timeout`，默认不杀进程；
+- 监控中断：SSH 连接失效或连续查询失败，通知一次 `monitor-stopped`。
+
+常用参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `job_notify` | 默认跟随插件 `jobNotify`；设为 `false` 表示 fire-and-forget |
+| `job_notify_log_lines` | 通知中附带日志尾部行数，0 表示不附带 |
+| `ready_command` | 就绪探测命令，退出码 0 表示成功；vLLM 可用 `/health` |
+| `ready_timeout_ms` | 启动超时，默认 20 分钟 |
+| `ready_interval_ms` | 探测间隔，默认 5 秒 |
+| `ready_stable_ms` | 连续稳定多久才算 ready，默认 5 秒且至少 2 次成功 |
+| `watch_after_ready` | ready 后继续监督，服务异常退出时再通知一次 |
+
+vLLM 示例：
+
+```json
+{
+  "ssh_id": "ssh_...",
+  "command": "vllm serve /models/qwen --port 8000",
+  "ready_command": "curl -fsS -m 3 http://127.0.0.1:8000/health",
+  "ready_timeout_ms": 1200000,
+  "ready_stable_ms": 5000,
+  "watch_after_ready": true
+}
+```
+
+重连后重新挂通知：
+
+```json
+{
+  "ssh_id": "ssh_new",
+  "job_id": "job_1a2b3c4d"
+}
+```
+
+`ssh_watch` 只重新注册通知，不启动或停止 job；不要再次调用 `ssh_job_start`，否则会新建 job。
+
+> `ssh_exec` 自己 `nohup ... &` 后脱离的任务不会被追踪，也不会产生通知。长任务请用 `ssh_job_start`；v1 的 `ssh_watch` 只支持已有 `job_id` 的 reattach，通用 pid/log/health watch 尚未实现。
 
 ### 2.11 sudo 密码的已知限制
 
@@ -502,7 +556,14 @@ npm install
         "connectTimeoutMs": 20000,
         "execTimeoutMs": 120000,
         "keepaliveIntervalMs": 15000,
-        "hostKeyPolicy": "accept-new"
+        "hostKeyPolicy": "accept-new",
+        "jobNotify": true,
+        "jobNotifyIntervalMs": 5000,
+        "jobNotifyLogLines": 40,
+        "jobReadyIntervalMs": 5000,
+        "jobReadyTimeoutMs": 1200000,
+        "jobReadyStableMs": 5000,
+        "jobWatchAfterReady": false
       }
     }
   ]
@@ -518,6 +579,13 @@ npm install
 | `execTimeoutMs` | `120000` | 默认命令超时 |
 | `keepaliveIntervalMs` | `15000` | keepalive 间隔，0 禁用 |
 | `hostKeyPolicy` | `accept-new` | 默认主机指纹策略 |
+| `jobNotify` | `true` | `ssh_job_start` 默认是否注册完成/就绪通知 |
+| `jobNotifyIntervalMs` | `5000` | job 状态初始检查间隔 |
+| `jobNotifyLogLines` | `40` | 通知中附带的日志尾部行数，0 表示不附带 |
+| `jobReadyIntervalMs` | `5000` | 服务就绪探测间隔 |
+| `jobReadyTimeoutMs` | `1200000` | 服务启动超时（20 分钟） |
+| `jobReadyStableMs` | `5000` | 连续成功多久才算 ready，至少 2 次成功 |
+| `jobWatchAfterReady` | `false` | ready 后默认是否继续监督异常退出 |
 
 ---
 
@@ -623,7 +691,9 @@ Profile 的 `prof_...` 是内部 id，只用于 RPC/存储，不在列表和选�
 - 不支持 SSH agent（Pageant / ssh-agent）、ProxyJump、端口转发；SFTP 仅实现文件读取/写入/编辑/删除/传输，不是完整的 OpenSSH SFTP 客户端；
 - 不支持 OTP / 2FA 的多轮 keyboard-interactive（当前把密码用于所有 prompt）；
 - 不读取 OpenSSH `~/.ssh/config` 和 `known_hosts`；
-- 每条 `ssh_exec` 是独立 channel，shell 状态不持久；
+- 每条 `ssh_exec` 是独立 channel，shell 状态不持久；`ssh_exec` 自己 detach 的后台任务不会被追踪，也不会产生通知；
+- `ssh_watch` v1 只支持已有 `job_id` 的 reattach，通用 pid / log / health watch 尚未实现；
+- job 的 `readiness` / `ready_at` 目前保存在插件内存中，OpenCode 重启后 `ssh_job_status` 不再显示这两个字段；
 - 同一私钥的口令目前只能在重新选择私钥时更新；
 - `known_hosts` 仍是本地 JSON 文件，未迁移到 SQLite；
 - RPC 是插件内部契约，暂未做跨版本兼容保证。

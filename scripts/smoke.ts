@@ -46,6 +46,11 @@ import {
 import { compileGlob, InvalidGlobPatternError } from "../src/ssh/glob.js";
 import { SearchService } from "../src/ssh/search.js";
 import { createSshTools, type ToolDefinition } from "../src/tools/definitions.js";
+import {
+  WatchNotifier,
+  formatJobNotice,
+  type JobNotice,
+} from "../src/ssh/watch-notifier.js";
 import { OutputCollector } from "../src/util.js";
 import { createFakeSftp } from "./fake-sftp.js";
 
@@ -1806,6 +1811,229 @@ async function main() {
     await server.close();
   }
 
+  const baseJob: JobInfo = {
+    jobId: "job_111122223333",
+    state: "running",
+    jobDir: "/home/tester/.opencode-ssh/jobs/job_111122223333",
+    logPath: "/home/tester/.opencode-ssh/jobs/job_111122223333/output.log",
+  };
+
+  {
+    const watchCalls: Array<Record<string, unknown>> = [];
+    const notifyTools = new Map(
+      createSshTools({
+        manager: {
+          getInfo: () => ({
+            id: "ssh_test",
+            name: "test",
+            user: "tester",
+            host: "127.0.0.1",
+            port: 22,
+            authMethod: "password",
+            connectedAt: new Date().toISOString(),
+            lastUsedAt: new Date().toISOString(),
+            idleMs: 0,
+            busy: false,
+          }),
+        } as unknown as ConnectionManager,
+        profiles: {} as ProfileStore,
+        config: { ...config, jobNotify: true },
+        search: {} as SearchService,
+        jobs: {
+          start: async () => ({
+            jobId: "job_notify0001",
+            pid: 123,
+            jobDir: "/home/tester/.opencode-ssh/jobs/job_notify0001",
+            logPath: "/home/tester/.opencode-ssh/jobs/job_notify0001/output.log",
+          }),
+        } as unknown as JobService,
+        watchNotifier: {
+          watchJob: (input: Record<string, unknown>) => {
+            watchCalls.push(input);
+            return "watch_test";
+          },
+        } as unknown as WatchNotifier,
+      }).map((tool) => [tool.name, tool]),
+    );
+    const startTool = notifyTools.get("job_start");
+    assert.ok(startTool);
+    await startTool.execute(
+      {
+        ssh_id: "ssh_test",
+        command: "sleep 100",
+        job_notify: true,
+        job_notify_log_lines: 12,
+        ready_command: "true",
+        ready_timeout_ms: 5_000,
+        ready_stable_ms: 0,
+        watch_after_ready: true,
+      },
+      {
+        sessionID: "ses_notify",
+        agent: "build",
+        messageID: "msg_notify",
+        id: "call_notify",
+        signal: new AbortController().signal,
+        progress: async () => undefined,
+      },
+    );
+    assert.equal(watchCalls.length, 1);
+    assert.equal(watchCalls[0]?.jobId, "job_notify0001");
+    assert.equal(watchCalls[0]?.sessionID, "ses_notify");
+    assert.equal(watchCalls[0]?.readyCommand, "true");
+    assert.equal(watchCalls[0]?.readyTimeoutMs, 5_000);
+    assert.equal(watchCalls[0]?.readyStableMs, 0);
+    assert.equal(watchCalls[0]?.watchAfterReady, true);
+    assert.equal(watchCalls[0]?.logLines, 12);
+  }
+
+  {
+    const notices: JobNotice[] = [];
+    let calls = 0;
+    const notifier = new WatchNotifier({
+      jobs: {
+        status: async () =>
+          calls++ === 0
+            ? baseJob
+            : { ...baseJob, state: "finished", exitCode: 0, log: "done" },
+      },
+      notify: async (notice) => {
+        notices.push(notice);
+      },
+      initialIntervalMs: 1,
+      maxIntervalMs: 1,
+    });
+    notifier.watchJob({
+      sshId: "ssh_test",
+      jobId: baseJob.jobId,
+      sessionID: "ses_test",
+    });
+    await waitFor(() => notices.length > 0);
+    assert.equal(notices[0]?.event, "exit");
+    assert.equal(notices[0]?.exitCode, 0);
+    assert.match(notices[0] ? formatJobNotice(notices[0]) : "", /done/);
+    notifier.dispose();
+  }
+
+  {
+    const notices: JobNotice[] = [];
+    const notifier = new WatchNotifier({
+      jobs: { status: async () => baseJob },
+      runProbe: async () => true,
+      notify: async (notice) => {
+        notices.push(notice);
+      },
+      initialIntervalMs: 1,
+      maxIntervalMs: 1,
+      readyIntervalMs: 1,
+      readyStableMs: 0,
+      readyTimeoutMs: 2_000,
+    });
+    notifier.watchJob({
+      sshId: "ssh_test",
+      jobId: "job_ready000001",
+      sessionID: "ses_test",
+      readyCommand: "true",
+    });
+    await waitFor(() => notices.length > 0);
+    assert.equal(notices[0]?.event, "ready");
+    assert.equal(notices[0]?.readiness, "ready");
+    notifier.dispose();
+  }
+
+  {
+    const notices: JobNotice[] = [];
+    const notifier = new WatchNotifier({
+      jobs: { status: async () => baseJob },
+      runProbe: async () => false,
+      notify: async (notice) => {
+        notices.push(notice);
+      },
+      initialIntervalMs: 1,
+      maxIntervalMs: 1,
+      readyIntervalMs: 1,
+      readyStableMs: 0,
+      readyTimeoutMs: 5,
+    });
+    notifier.watchJob({
+      sshId: "ssh_test",
+      jobId: "job_timeout0001",
+      sessionID: "ses_test",
+      readyCommand: "false",
+    });
+    await waitFor(() => notices.length > 0);
+    assert.equal(notices[0]?.event, "timeout");
+    assert.equal(notices[0]?.readiness, "timeout");
+    notifier.dispose();
+  }
+
+  {
+    const notices: JobNotice[] = [];
+    let calls = 0;
+    const notifier = new WatchNotifier({
+      jobs: {
+        status: async () =>
+          calls++ < 3
+            ? { ...baseJob, jobId: "job_crash000001" }
+            : {
+                ...baseJob,
+                jobId: "job_crash000001",
+                state: "finished",
+                exitCode: 137,
+              },
+      },
+      runProbe: async () => true,
+      notify: async (notice) => {
+        notices.push(notice);
+      },
+      initialIntervalMs: 1,
+      maxIntervalMs: 1,
+      readyIntervalMs: 1,
+      readyStableMs: 0,
+      readyTimeoutMs: 2_000,
+    });
+    notifier.watchJob({
+      sshId: "ssh_test",
+      jobId: "job_crash000001",
+      sessionID: "ses_test",
+      readyCommand: "true",
+      watchAfterReady: true,
+    });
+    await waitFor(() => notices.length >= 2);
+    assert.deepEqual(
+      notices.map((notice) => notice.event),
+      ["ready", "service-exited"],
+    );
+    assert.equal(notices[1]?.exitCode, 137);
+    notifier.dispose();
+  }
+
+  {
+    const notices: JobNotice[] = [];
+    const notifier = new WatchNotifier({
+      jobs: {
+        status: async () => {
+          throw new Error("ssh connection lost");
+        },
+      },
+      notify: async (notice) => {
+        notices.push(notice);
+      },
+      initialIntervalMs: 1,
+      maxIntervalMs: 1,
+      maxFailures: 2,
+    });
+    notifier.watchJob({
+      sshId: "ssh_test",
+      jobId: "job_monitor0001",
+      sessionID: "ses_test",
+    });
+    await waitFor(() => notices.length > 0);
+    assert.equal(notices[0]?.event, "monitor-stopped");
+    assert.match(notices[0] ? formatJobNotice(notices[0]) : "", /connection lost/);
+    notifier.dispose();
+  }
+
   console.log("smoke tests passed");
 }
 
@@ -2003,6 +2231,19 @@ function writeJobFixture(
   writeFileSync(path.join(dir, "pid"), `${pid}\n`);
   writeFileSync(path.join(dir, "started_at"), `${startedAt}\n`);
   return `/home/tester/.opencode-ssh/jobs/${jobId}`;
+}
+
+async function waitFor(
+  predicate: () => boolean,
+  timeoutMs = 2_000,
+): Promise<void> {
+  const started = Date.now();
+  while (!predicate()) {
+    if (Date.now() - started > timeoutMs) {
+      throw new Error("Timed out waiting for notification.");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
 }
 
 /**
