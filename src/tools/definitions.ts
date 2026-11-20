@@ -846,14 +846,30 @@ export function createSshTools(
           },
         });
 
+        const targetLabel = `${info.user}@${info.host}:${info.port}`;
+        const suspended = (
+          dependencies.watchNotifier?.listSuspended() ?? []
+        ).filter(
+          (watch) =>
+            watch.hostLabel === targetLabel || watch.hostLabel === undefined,
+        );
+        const content = formatConnection(
+          info,
+          info.reused
+            ? "Reused existing SSH connection."
+            : "SSH connection established.",
+        );
         return {
-          content: formatConnection(
-            info,
-            info.reused
-              ? "Reused existing SSH connection."
-              : "SSH connection established.",
-          ),
-          metadata: connectionMetadata(info),
+          content:
+            suspended.length > 0
+              ? `${content}\n\nSuspended watches for this target: ${suspended.length}. Use ssh_watch_list; reattach jobs with ssh_watch({ ssh_id, job_id }).`
+              : content,
+          metadata: {
+            ...connectionMetadata(info),
+            ...(suspended.length > 0
+              ? { suspendedWatches: suspended.length }
+              : {}),
+          },
         };
       },
     },
@@ -867,13 +883,35 @@ export function createSshTools(
         const input = asRecord(raw);
         const sshId = requireString(input.ssh_id, "ssh_id");
         const info = await dependencies.manager.disconnect(sshId);
+        const suspended =
+          dependencies.watchNotifier?.suspendBySshId(sshId) ?? [];
+        const lines = [
+          "SSH connection closed.",
+          `ssh_id: ${info.id}`,
+          `target: ${info.user}@${info.host}:${info.port}`,
+        ];
+        if (suspended.length > 0) {
+          lines.push(
+            "",
+            `Suspended ${suspended.length} watch(es); no monitor-stopped notification was sent.`,
+          );
+          for (const watch of suspended) {
+            lines.push(
+              `- ${watch.watchId}${watch.jobId !== undefined ? ` job=${watch.jobId}` : ""} kind=${watch.kind}`,
+            );
+          }
+          if (suspended.some((watch) => watch.jobId !== undefined)) {
+            lines.push(
+              "Jobs may still be running remotely. After ssh_connect, call ssh_watch({ ssh_id, job_id }) to reattach.",
+            );
+          }
+        }
         return {
-          content: [
-            "SSH connection closed.",
-            `ssh_id: ${info.id}`,
-            `target: ${info.user}@${info.host}:${info.port}`,
-          ].join("\n"),
-          metadata: { sshId: info.id },
+          content: lines.join("\n"),
+          metadata: {
+            sshId: info.id,
+            suspendedWatches: suspended.length,
+          },
         };
       },
     },
@@ -1692,18 +1730,19 @@ export function createSshTools(
         "Kills the whole process group when available. Refuses to signal a pid whose command line " +
         "does not belong to the job, which protects against pid reuse. " +
         "Only the host process is tracked; containers keep their own lifecycle and are not stopped. " +
-        "Finished jobs are reported without doing anything. This is the job termination tool; no separate job_kill is needed.",
+        "Finished jobs are reported without doing anything. This is the job termination tool; no separate job_kill is needed. " +
+        "It also cancels this job's notification watches so an intentional stop does not produce a crash notification.",
       input: JOB_STOP_INPUT,
       options: { namespace: "ssh", codemode: true },
       execute: async (raw, context) => {
         const input = asRecord(raw);
         const sshId = requireString(input.ssh_id, "ssh_id");
+        const jobId = requireString(input.job_id, "job_id");
         await assertHostPermission(dependencies, context, sshId);
 
-        const result = await dependencies.jobs.stop(
-          sshId,
-          requireString(input.job_id, "job_id"),
-        );
+        const canceled =
+          dependencies.watchNotifier?.cancelJob(jobId) ?? [];
+        const result = await dependencies.jobs.stop(sshId, jobId);
 
         const lines: string[] = [];
         switch (result.outcome) {
@@ -1726,9 +1765,15 @@ export function createSshTools(
             );
             break;
         }
+        if (canceled.length > 0) {
+          lines.push(
+            "",
+            `Canceled ${canceled.length} notification watch(es) for this job.`,
+          );
+        }
         return {
           content: lines.join("\n"),
-          metadata: { ...result },
+          metadata: { ...result, watchesCanceled: canceled.length },
         };
       },
     },
@@ -1927,6 +1972,7 @@ export function createSshTools(
             : new CompositeSource(sources);
         const watchId = dependencies.watchNotifier.watch({
           source,
+          sshId,
           sessionID,
           agent: context.agent,
           ...(name !== undefined ? { name } : {}),
@@ -1971,7 +2017,7 @@ export function createSshTools(
         return {
           content: removed
             ? `Watch canceled: ${watchId}`
-            : `No active watch found: ${watchId}`,
+            : `No active or suspended watch found: ${watchId}`,
           metadata: { watchId, removed },
         };
       },
@@ -1980,24 +2026,41 @@ export function createSshTools(
     {
       name: "watch_list",
       description:
-        "List active notification watches (job_id, session, readiness, start time). It does not list jobs or remote processes.",
+        "List active and suspended notification watches (kind, job_id, session, readiness, state). Suspended watches were canceled by an intentional ssh_disconnect; jobs may still be running and can be reattached with ssh_watch.",
       input: LIST_INPUT,
       options: { namespace: "ssh", codemode: true },
       execute: async () => {
         if (dependencies.watchNotifier === undefined) {
           return { content: "No active watches." };
         }
-        const watches = dependencies.watchNotifier.list();
-        if (watches.length === 0) return { content: "No active watches." };
-        const lines = [`watches: ${watches.length}`];
-        for (const watch of watches) {
-          const bits = [watch.watchId, watch.jobId, `session=${watch.sessionID}`];
+        const active = dependencies.watchNotifier.list();
+        const suspended = dependencies.watchNotifier.listSuspended();
+        if (active.length === 0 && suspended.length === 0) {
+          return { content: "No active watches." };
+        }
+        const lines = [
+          `watches: ${active.length} active, ${suspended.length} suspended`,
+        ];
+        for (const watch of [...active, ...suspended]) {
+          const bits = [
+            watch.watchId,
+            `kind=${watch.kind}`,
+            ...(watch.jobId !== undefined ? [`job=${watch.jobId}`] : []),
+            `session=${watch.sessionID}`,
+            `state=${watch.state}`,
+          ];
           if (watch.readiness !== undefined) {
             bits.push(`readiness=${watch.readiness}`);
           }
           if (watch.name !== undefined) bits.push(`name=${watch.name}`);
           if (watch.hostLabel !== undefined) bits.push(watch.hostLabel);
           lines.push(`- ${bits.join("  ")}`);
+        }
+        if (suspended.some((watch) => watch.jobId !== undefined)) {
+          lines.push(
+            "",
+            "Suspended jobs may still be running. After ssh_connect, call ssh_watch({ ssh_id, job_id }) to reattach.",
+          );
         }
         return { content: lines.join("\n") };
       },

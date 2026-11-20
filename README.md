@@ -471,7 +471,14 @@ echo $! > /tmp/train.pid
 }
 ```
 
-`ssh_unwatch({ watch_id })` 只取消通知，不停止任务；`ssh_watch_list()` 列出活跃 watch。
+`ssh_unwatch({ watch_id })` 只取消通知，不停止任务；`ssh_watch_list()` 列出活跃和 suspended watch。
+
+终止/断开时的 watch 行为：
+
+- `ssh_job_stop` 会先取消该 `job_id` 的所有 watch，再终止 job，避免把主动停止误报成崩溃；
+- `ssh_disconnect` 会把该 `ssh_id` 下的 watch 标记为 `suspended`，不发送 `monitor-stopped`；job 可能仍在远端运行；
+- `ssh_connect` 成功后，如果该目标有 suspended watch，会提示数量；
+- 重连后调用 `ssh_watch({ ssh_id, job_id })` 重新挂 job 通知；`ssh_unwatch` 只用于“停止监控但不停任务”或通用 watch。
 
 ### 2.11 sudo 密码的已知限制
 

@@ -113,6 +113,7 @@
 
 - 2026-11-20：v1 job 通知（分支 `feat/job-notifications`）：`WatchNotifier` + `JobSource`；`ssh_job_start` 默认注册完成/就绪通知，支持 `job_notify`、`job_notify_log_lines`、`ready_command`、`ready_timeout_ms`、`ready_interval_ms`、`ready_stable_ms`、`watch_after_ready`；终态通过 `session.synthetic({ resume: true })` 唤醒会话；新增 `ssh_watch` / `ssh_unwatch` / `ssh_watch_list`；`ssh_exec` 描述明确自 detach 不追踪。readiness 状态暂存内存，持久化待后续。
 - 2026-11-20：通用 watch（同一分支）：`ssh_watch` 支持 `job_id` reattach、`pid` / `pid_file`、`log_path` + `success_regex` / `failure_regex`、`ready_command`、`timeout_ms`；新增 `watch-types.ts` / `watch-sources.ts`（Job / Pid / Log / Health / Timeout / Composite source），复用同一 `WatchNotifier` 调度、去重和 synthetic 唤醒。
+- 2026-11-20：watch 生命周期收尾：`ssh_job_stop` 自动取消该 job 的 watch；`ssh_disconnect` 把该 ssh_id 的 watch 标记为 suspended，不发送 monitor-stopped；`ssh_connect` 提示 suspended 数量；`ssh_watch_list` 同时列出 active/suspended；`ssh_unwatch` 可取消 suspended。suspended 列表目前只在内存，持久化待后续。
 - 2026-11：7 个工具（connect / disconnect / list / exec / profile_add / profile_update / profile_remove / profile_list）实现完毕。
 - 2026-11：profile 迁移到 `ctx.storage`（SQLite），移除 `profiles.json`。
 - 2026-11：密码、私钥口令、sudo 密码使用 AES-256-GCM 加密；活跃连接和 sudo 密码仅保存在内存。

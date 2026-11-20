@@ -104,7 +104,10 @@ Use the job tools when a task should outlive one tool call (training, builds, mi
 - After reconnect or OpenCode restart, reattach a job with `ssh_watch({ ssh_id, job_id })`; this only re-registers notification. Never call `ssh_job_start` again for the same job, or a second job is created.
 - For work that `ssh_exec` started and detached (`nohup ... &`, `docker run -d`), use `ssh_watch` with a `pid`/`pid_file`, `log_path` + success/failure regex, `ready_command`, and/or `timeout_ms`. `ssh_exec` itself does not track or notify for detached work.
 - `ssh_watch` with `watch_after_ready: true` requires `pid` or `pid_file`; health alone cannot detect a later crash.
-- `ssh_unwatch({ watch_id })` cancels notification only; it does not stop the task. `ssh_watch_list()` lists active watches.
+- `ssh_unwatch({ watch_id })` cancels notification only; it does not stop the task. `ssh_watch_list()` lists active and suspended watches.
+- `ssh_job_stop` automatically cancels that job's watches before stopping it. Do not call `ssh_unwatch` first for a job.
+- `ssh_disconnect` suspends watches for that ssh_id without a `monitor-stopped` notification. Jobs may still run remotely; after reconnecting, use `ssh_watch({ ssh_id, job_id })` to reattach. `ssh_connect` reports the number of suspended watches for the target.
+- For a generic watched process that you are about to kill with `ssh_exec`, call `ssh_unwatch` first if you do not want a `pid-exited` notification.
 
 ## Security
 

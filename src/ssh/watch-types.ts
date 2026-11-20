@@ -13,7 +13,8 @@ export type WatchState =
   | "ready"
   | "timeout"
   | "exited"
-  | "monitor-stopped";
+  | "monitor-stopped"
+  | "suspended";
 
 export type JobReadiness = "pending" | "ready" | "failed" | "timeout";
 
@@ -91,5 +92,6 @@ export interface WatchSummary {
   hostLabel?: string;
   readiness?: JobReadiness;
   state: WatchState;
+  suspended?: boolean;
   startedAt: number;
 }

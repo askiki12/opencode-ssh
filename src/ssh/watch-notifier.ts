@@ -110,6 +110,7 @@ interface WatchRecord {
 
 export class WatchNotifier {
   private readonly active = new Map<string, WatchRecord>();
+  private readonly suspended = new Map<string, WatchSummary>();
   private readonly completed = new Map<string, CompletedWatch>();
 
   constructor(private readonly options: WatchNotifierOptions) {}
@@ -174,6 +175,9 @@ export class WatchNotifier {
         record.abort.abort();
         this.active.delete(record.watchId);
       }
+      for (const [watchId, summary] of this.suspended) {
+        if (summary.jobId === input.jobId) this.suspended.delete(watchId);
+      }
     }
 
     const record: WatchRecord = {
@@ -218,29 +222,56 @@ export class WatchNotifier {
 
   unwatch(watchId: string): boolean {
     const record = this.active.get(watchId);
-    if (!record) return false;
-    record.abort.abort();
-    this.active.delete(watchId);
-    return true;
+    if (record) {
+      record.abort.abort();
+      this.active.delete(watchId);
+      return true;
+    }
+    return this.suspended.delete(watchId);
   }
 
   list(): WatchSummary[] {
     return [...this.active.values()]
-      .map((record) => ({
-        watchId: record.watchId,
-        kind: record.source.kind,
-        ...(record.jobId !== undefined ? { jobId: record.jobId } : {}),
-        ...(record.sshId !== undefined ? { sshId: record.sshId } : {}),
-        sessionID: record.sessionID,
-        ...(record.name !== undefined ? { name: record.name } : {}),
-        ...(record.hostLabel !== undefined ? { hostLabel: record.hostLabel } : {}),
-        ...(record.readiness !== undefined
-          ? { readiness: record.readiness }
-          : {}),
-        state: record.state,
-        startedAt: record.startedAt,
-      }))
+      .map((record) => this.summary(record))
       .sort((left, right) => left.startedAt - right.startedAt);
+  }
+
+  listSuspended(): WatchSummary[] {
+    return [...this.suspended.values()].sort(
+      (left, right) => left.startedAt - right.startedAt,
+    );
+  }
+
+  /**
+   * Stop watches for an intentional ssh_disconnect without emitting a
+   * misleading "monitor stopped" notification. The jobs may still be running.
+   */
+  suspendBySshId(sshId: string): WatchSummary[] {
+    const summaries: WatchSummary[] = [];
+    for (const record of [...this.active.values()]) {
+      if (record.sshId !== sshId) continue;
+      record.abort.abort();
+      this.active.delete(record.watchId);
+      const summary = this.summary(record, "suspended");
+      this.suspended.set(record.watchId, summary);
+      summaries.push(summary);
+    }
+    return summaries;
+  }
+
+  /** Stop watches for a job that is being intentionally terminated. */
+  cancelJob(jobId: string): WatchSummary[] {
+    const canceled: WatchSummary[] = [];
+    for (const record of [...this.active.values()]) {
+      if (record.jobId !== jobId) continue;
+      record.abort.abort();
+      this.active.delete(record.watchId);
+      canceled.push(this.summary(record));
+    }
+    for (const [watchId, summary] of this.suspended) {
+      if (summary.jobId === jobId) this.suspended.delete(watchId);
+    }
+    return canceled;
   }
 
   describe(
@@ -270,7 +301,29 @@ export class WatchNotifier {
   dispose(): void {
     for (const record of this.active.values()) record.abort.abort();
     this.active.clear();
+    this.suspended.clear();
     this.completed.clear();
+  }
+
+  private summary(
+    record: WatchRecord,
+    state: WatchState = record.state,
+  ): WatchSummary {
+    return {
+      watchId: record.watchId,
+      kind: record.source.kind,
+      ...(record.jobId !== undefined ? { jobId: record.jobId } : {}),
+      ...(record.sshId !== undefined ? { sshId: record.sshId } : {}),
+      sessionID: record.sessionID,
+      ...(record.name !== undefined ? { name: record.name } : {}),
+      ...(record.hostLabel !== undefined ? { hostLabel: record.hostLabel } : {}),
+      ...(record.readiness !== undefined
+        ? { readiness: record.readiness }
+        : {}),
+      state,
+      ...(state === "suspended" ? { suspended: true } : {}),
+      startedAt: record.startedAt,
+    };
   }
 
   private async run(record: WatchRecord): Promise<void> {

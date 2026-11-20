@@ -1934,6 +1934,55 @@ async function main() {
   }
 
   {
+    const notices: JobNotice[] = [];
+    const pendingSource: WatchSource = {
+      kind: "pid",
+      check: async ({ signal }) =>
+        new Promise((resolve) => {
+          signal.addEventListener(
+            "abort",
+            () => resolve({ state: "pending" }),
+            { once: true },
+          );
+        }),
+    };
+    const notifier = new WatchNotifier({
+      jobs: { status: async () => baseJob },
+      notify: async (notice) => {
+        notices.push(notice);
+      },
+      initialIntervalMs: 1_000,
+      maxIntervalMs: 1_000,
+    });
+
+    const watchId = notifier.watch({
+      source: pendingSource,
+      sshId: "ssh_suspend",
+      sessionID: "ses_suspend",
+      name: "suspend-test",
+      jobId: "job_suspend",
+    });
+    assert.equal(notifier.list().length, 1);
+    const suspended = notifier.suspendBySshId("ssh_suspend");
+    assert.equal(suspended.length, 1);
+    assert.equal(suspended[0]?.watchId, watchId);
+    assert.equal(notifier.list().length, 0);
+    assert.equal(notifier.listSuspended().length, 1);
+    assert.equal(notices.length, 0);
+
+    notifier.watchJob({
+      sshId: "ssh_new",
+      jobId: "job_suspend",
+      sessionID: "ses_suspend",
+    });
+    assert.equal(notifier.listSuspended().length, 0);
+    const canceled = notifier.cancelJob("job_suspend");
+    assert.equal(canceled.length, 1);
+    assert.equal(notifier.list().length, 0);
+    notifier.dispose();
+  }
+
+  {
     const watchCalls: Array<Record<string, unknown>> = [];
     const notifyTools = new Map(
       createSshTools({
@@ -2072,6 +2121,105 @@ async function main() {
         ),
       /requires pid or pid_file/,
     );
+  }
+
+  {
+    const calls: string[] = [];
+    const lifecycleTools = new Map(
+      createSshTools({
+        manager: {
+          getInfo: () => ({
+            id: "ssh_test",
+            name: "test",
+            user: "tester",
+            host: "127.0.0.1",
+            port: 22,
+            authMethod: "password",
+            connectedAt: new Date().toISOString(),
+            lastUsedAt: new Date().toISOString(),
+            idleMs: 0,
+            busy: false,
+          }),
+          disconnect: async () => ({
+            id: "ssh_test",
+            name: "test",
+            user: "tester",
+            host: "127.0.0.1",
+            port: 22,
+            authMethod: "password",
+            connectedAt: new Date().toISOString(),
+            lastUsedAt: new Date().toISOString(),
+            idleMs: 0,
+            busy: false,
+          }),
+        } as unknown as ConnectionManager,
+        profiles: {} as ProfileStore,
+        config: { ...config },
+        search: {} as SearchService,
+        jobs: {
+          stop: async () => ({
+            jobId: "job_stop_test",
+            outcome: "stopped",
+            pid: 456,
+          }),
+        } as unknown as JobService,
+        watchNotifier: {
+          suspendBySshId: (sshId: string) => {
+            calls.push(`suspend:${sshId}`);
+            return [
+              {
+                watchId: "watch_suspended",
+                kind: "job",
+                jobId: "job_stop_test",
+                sessionID: "ses_lifecycle",
+                state: "suspended",
+                suspended: true,
+                startedAt: 0,
+              },
+            ];
+          },
+          cancelJob: (jobId: string) => {
+            calls.push(`cancel:${jobId}`);
+            return [
+              {
+                watchId: "watch_suspended",
+                kind: "job",
+                jobId,
+                sessionID: "ses_lifecycle",
+                state: "pending",
+                startedAt: 0,
+              },
+            ];
+          },
+        } as unknown as WatchNotifier,
+      }).map((tool) => [tool.name, tool]),
+    );
+
+    const lifecycleContext = {
+      sessionID: "ses_lifecycle",
+      agent: "build",
+      messageID: "msg_lifecycle",
+      id: "call_lifecycle",
+      signal: new AbortController().signal,
+      progress: async () => undefined,
+    };
+    const disconnectTool = lifecycleTools.get("disconnect");
+    assert.ok(disconnectTool);
+    const disconnected = await disconnectTool.execute(
+      { ssh_id: "ssh_test" },
+      lifecycleContext,
+    );
+    assert.match(disconnected.content, /Suspended 1 watch/);
+    assert.match(disconnected.content, /ssh_watch/);
+
+    const stopTool = lifecycleTools.get("job_stop");
+    assert.ok(stopTool);
+    const stopped = await stopTool.execute(
+      { ssh_id: "ssh_test", job_id: "job_stop_test" },
+      lifecycleContext,
+    );
+    assert.match(stopped.content, /Canceled 1 notification watch/);
+    assert.deepEqual(calls, ["suspend:ssh_test", "cancel:job_stop_test"]);
   }
 
   {
