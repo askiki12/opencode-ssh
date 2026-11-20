@@ -50,6 +50,14 @@
   - 当前 `ssh_job_status` 的 `readiness` / `ready_at` 来自内存中的 `WatchNotifier`，插件重启后丢失。
   - 预期：ready 时写 `ready_at`，timeout/failed 时写 `ready_timeout_at` / `ready_failed_at`，由 `JobService.status` 读取。
 
+- [ ] **Phase 2：SSH 反向隧道任务回调（可选）**
+  - 现状：已完成 watcher 轮询 + `session.synthetic`，覆盖 job 退出、服务 ready/failed/timeout、通用 pid/log/health。
+  - 目标：任务退出时由远端主动回调，降低通知延迟（不用等 5～30 秒轮询），减少大量短任务/安静任务的 SSH 轮询。
+  - 场景：任务脚本能在结束时执行 `curl`/`wget`；不想暴露公网 OpenCode；现有 SSH 连接可做反向隧道。
+  - 最小实现：本地 `CallbackHub`（`127.0.0.1:0` + 随机 token）；`ssh2` `forwardIn("127.0.0.1", 0)`；`job.sh` 在写 `exit_code` 后 `curl -m 5`；token 映射到 watch/job，触发同一 `WatchNotifier` 通知。
+  - 限制：只覆盖进程退出，不覆盖服务 ready；依赖 sshd `AllowTcpForwarding`、远端 curl/wget；必须保留 watcher 兜底；token 单次有效、只绑 loopback。
+  - 详细设计：工作区 `docs/job-completion-notifications.md` 第 7 节。
+
 - [ ] **`fleet_exec`：多机并发执行**
   - 价值：一次调用替代 N 次工具调用；并发上限、`stop_on_error`、rolling 分批、每台独立结果；按 tag 选择可减少提示体积。
   - 前置：profile 目前没有 tag/分组，需要扩展数据模型和 UI。
@@ -85,6 +93,7 @@
 - [ ] **端口转发 / 隧道**
   - 目前不支持本地转发、远程转发和动态转发。
   - 与“执行命令”是两类需求，优先级最低。
+  - Phase 2 的 SSH 反向隧道回调只需要 remote forward（`forwardIn`），可以作为该能力的第一个最小用例。
 
 - [ ] **`known_hosts` 从本地 JSON 迁移到 SQLite**
   - 当前 `known_hosts.json` 由 `src/known-hosts.ts` 直接读写文件。
