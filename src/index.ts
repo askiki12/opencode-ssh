@@ -9,7 +9,11 @@ import { createRpcHandlers } from "./rpc-handlers.js";
 import { ConnectionManager } from "./ssh/manager.js";
 import { JobService } from "./ssh/jobs.js";
 import { SearchService } from "./ssh/search.js";
-import { formatJobNotice, WatchNotifier } from "./ssh/watch-notifier.js";
+import {
+  formatJobNotice,
+  WatchNotifier,
+  type PersistedWatch,
+} from "./ssh/watch-notifier.js";
 import { createSshTools } from "./tools/definitions.js";
 
 export default Plugin.define({
@@ -49,6 +53,17 @@ export default Plugin.define({
           return false;
         }
       },
+      storage: {
+        load: async () => {
+          const stored = await ctx.storage.get("watchSubscriptions");
+          return Array.isArray(stored)
+            ? (stored as PersistedWatch[])
+            : undefined;
+        },
+        save: async (watches) => {
+          await ctx.storage.set("watchSubscriptions", watches as never);
+        },
+      },
       notify: async (notice) => {
         await ctx.session.synthetic({
           sessionID: notice.sessionID as never,
@@ -79,6 +94,7 @@ export default Plugin.define({
         });
       },
     });
+    await watchNotifier.initialize();
     const rpcRegistration = await ctx.rpc.register(
       SshRpc,
       createRpcHandlers({ manager, profiles }),
@@ -120,7 +136,7 @@ export default Plugin.define({
 
     return async () => {
       try {
-        watchNotifier.dispose();
+        await watchNotifier.dispose();
         await registration.dispose();
       } finally {
         try {

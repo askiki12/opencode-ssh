@@ -50,6 +50,7 @@ import {
   WatchNotifier,
   formatJobNotice,
   type JobNotice,
+  type PersistedWatch,
   type WatchSource,
 } from "../src/ssh/watch-notifier.js";
 import {
@@ -1983,6 +1984,66 @@ async function main() {
   }
 
   {
+    const storage: { value: PersistedWatch[] | undefined } = { value: undefined };
+    const adapter = {
+      load: async () => storage.value,
+      save: async (watches: PersistedWatch[]) => {
+        storage.value = structuredClone(watches);
+      },
+    };
+    const pendingSource: WatchSource = {
+      kind: "pid",
+      key: "pid:persist",
+      descriptor: { kind: "pid", pid: 999 },
+      check: async ({ signal }) =>
+        new Promise((resolve) => {
+          signal.addEventListener(
+            "abort",
+            () => resolve({ state: "pending" }),
+            { once: true },
+          );
+        }),
+    };
+    const first = new WatchNotifier({
+      notify: async () => undefined,
+      storage: adapter,
+      initialIntervalMs: 1_000,
+    });
+    first.watch({
+      source: pendingSource,
+      sshId: "ssh_persist",
+      jobId: "job_persist",
+      sessionID: "ses_persist",
+      name: "persist-test",
+    });
+    first.suspendBySshId("ssh_persist");
+    await first.dispose();
+    assert.equal(storage.value?.length, 1);
+    assert.equal(storage.value?.[0]?.jobId, "job_persist");
+
+    const second = new WatchNotifier({
+      jobs: { status: async () => baseJob },
+      notify: async () => undefined,
+      storage: adapter,
+      initialIntervalMs: 1_000,
+    });
+    await second.initialize();
+    const restored = second.listSuspended();
+    assert.equal(restored.length, 1);
+    assert.equal(restored[0]?.jobId, "job_persist");
+    assert.equal(restored[0]?.state, "suspended");
+
+    second.watchJob({
+      sshId: "ssh_new_persist",
+      jobId: "job_persist",
+      sessionID: "ses_persist",
+    });
+    assert.equal(second.listSuspended().length, 0);
+    second.cancelJob("job_persist");
+    await second.dispose();
+  }
+
+  {
     const watchCalls: Array<Record<string, unknown>> = [];
     const notifyTools = new Map(
       createSshTools({
@@ -2366,6 +2427,7 @@ async function main() {
     await waitFor(() => notices.length > 0);
     assert.equal(notices[0]?.event, "monitor-stopped");
     assert.match(notices[0] ? formatJobNotice(notices[0]) : "", /connection lost/);
+    assert.equal(notifier.listSuspended().length, 1);
     notifier.dispose();
   }
 

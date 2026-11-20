@@ -480,6 +480,14 @@ echo $! > /tmp/train.pid
 - `ssh_connect` 成功后，如果该目标有 suspended watch，会提示数量；
 - 重连后调用 `ssh_watch({ ssh_id, job_id })` 重新挂 job 通知；`ssh_unwatch` 只用于“停止监控但不停任务”或通用 watch。
 
+watch 订阅会持久化到本地 `ctx.storage` 的 `watchSubscriptions`：
+
+- OpenCode 重启或插件重载后，原 active watch 会被标记为 `suspended`，不会自动恢复；
+- `ssh_connect` 会提示该目标有多少 suspended watch；
+- `ssh_watch_list` 显示 `watch_id`、`kind`、`job_id`、`conditions` 和 `state`；
+- 超过 7 天的 suspended 记录会在加载时清理；
+- 持久化的只是“如何重新挂”的信息，不是远端任务状态；job 状态仍以远端 job 目录为准。
+
 ### 2.11 sudo 密码的已知限制
 
 **插件不会在保存 profile 或建立连接时校验 sudo 密码。**

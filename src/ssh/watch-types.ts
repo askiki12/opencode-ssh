@@ -48,10 +48,29 @@ export interface WatchCheck {
   nextIntervalMs?: number;
 }
 
+export interface WatchDescriptor {
+  kind: WatchKind;
+  jobId?: string;
+  readyCommand?: string;
+  readyTimeoutMs?: number;
+  readyIntervalMs?: number;
+  readyStableMs?: number;
+  pid?: number;
+  pidFile?: string;
+  logPath?: string;
+  successRegex?: string;
+  failureRegex?: string;
+  logLines?: number;
+  timeoutMs?: number;
+  sources?: WatchDescriptor[];
+}
+
 export interface WatchSource {
   readonly kind: WatchKind;
   /** Stable key for duplicate suppression, for example `${sshId}:${jobId}`. */
   readonly key?: string;
+  /** Serializable description used to restore suspended watches. */
+  readonly descriptor?: WatchDescriptor | undefined;
   /** Current readiness for service sources. */
   readonly readiness?: JobReadiness | undefined;
   readonly readyAt?: number | undefined;
@@ -82,6 +101,25 @@ export interface WatchNotice {
   outcome?: "success" | "failure";
 }
 
+export interface PersistedWatch {
+  watchId: string;
+  kind: WatchKind;
+  sessionID: string;
+  agent?: string;
+  name?: string;
+  hostLabel?: string;
+  sshId?: string;
+  jobId?: string;
+  descriptor: WatchDescriptor;
+  logLines?: number;
+  watchAfterReady?: boolean;
+  state: WatchState;
+  startedAt: number;
+  suspendedAt?: number;
+  readiness?: JobReadiness;
+  readyAt?: number;
+}
+
 export interface WatchSummary {
   watchId: string;
   kind: WatchKind;
@@ -91,6 +129,7 @@ export interface WatchSummary {
   name?: string;
   hostLabel?: string;
   readiness?: JobReadiness;
+  conditions?: string;
   state: WatchState;
   suspended?: boolean;
   startedAt: number;

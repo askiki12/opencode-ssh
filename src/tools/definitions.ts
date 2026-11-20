@@ -2052,6 +2052,9 @@ export function createSshTools(
           if (watch.readiness !== undefined) {
             bits.push(`readiness=${watch.readiness}`);
           }
+          if (watch.conditions !== undefined) {
+            bits.push(`conditions=${watch.conditions}`);
+          }
           if (watch.name !== undefined) bits.push(`name=${watch.name}`);
           if (watch.hostLabel !== undefined) bits.push(watch.hostLabel);
           lines.push(`- ${bits.join("  ")}`);

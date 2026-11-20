@@ -3,7 +3,9 @@ import type { JobService } from "./jobs.js";
 import { JobSource } from "./watch-sources.js";
 import type {
   JobReadiness,
+  PersistedWatch,
   WatchCheck,
+  WatchDescriptor,
   WatchEvent,
   WatchNotice,
   WatchSource,
@@ -13,6 +15,7 @@ import type {
 
 export type {
   JobReadiness,
+  PersistedWatch,
   WatchEvent,
   WatchKind,
   WatchNotice,
@@ -20,6 +23,11 @@ export type {
   WatchState,
   WatchSummary,
 } from "./watch-types.js";
+
+export interface WatchStorage {
+  load(): Promise<PersistedWatch[] | undefined>;
+  save(watches: PersistedWatch[]): Promise<void>;
+}
 
 export type JobNotice = WatchNotice;
 export type JobNoticeEvent = WatchEvent;
@@ -72,6 +80,7 @@ export interface WatchNotifierOptions {
   watchAfterReady?: boolean;
   maxFailures?: number;
   onError?: (error: unknown) => void;
+  storage?: WatchStorage;
   /** Injectable clock and sleep for tests. */
   now?: () => number;
   sleep?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
@@ -87,6 +96,7 @@ interface WatchRecord {
   watchId: string;
   key: string;
   source: WatchSource;
+  descriptor: WatchDescriptor;
   sessionID: string;
   agent?: string;
   name?: string;
@@ -110,10 +120,47 @@ interface WatchRecord {
 
 export class WatchNotifier {
   private readonly active = new Map<string, WatchRecord>();
-  private readonly suspended = new Map<string, WatchSummary>();
+  private readonly suspended = new Map<string, PersistedWatch>();
   private readonly completed = new Map<string, CompletedWatch>();
+  private disposed = false;
+  private persistQueue: Promise<void> = Promise.resolve();
 
   constructor(private readonly options: WatchNotifierOptions) {}
+
+  /**
+   * Load persisted watches after an OpenCode restart. They are shown as
+   * suspended, never resumed automatically: the old ssh_id is invalid and the
+   * agent must decide whether to reconnect and reattach.
+   */
+  async initialize(): Promise<void> {
+    if (this.options.storage === undefined) return;
+    let stored: PersistedWatch[] | undefined;
+    try {
+      stored = await this.options.storage.load();
+    } catch (error) {
+      this.options.onError?.(error);
+      return;
+    }
+    if (!Array.isArray(stored)) return;
+
+    const cutoff = this.now() - 7 * 24 * 60 * 60 * 1000;
+    for (const watch of stored) {
+      if (
+        typeof watch?.watchId !== "string" ||
+        typeof watch?.sessionID !== "string" ||
+        typeof watch?.startedAt !== "number" ||
+        watch.startedAt < cutoff
+      ) {
+        continue;
+      }
+      this.suspended.set(watch.watchId, {
+        ...watch,
+        state: "suspended",
+        suspendedAt: watch.suspendedAt ?? this.now(),
+      });
+    }
+    await this.persistNow();
+  }
 
   /** Convenience entry point used by ssh_job_start. */
   watchJob(input: WatchJobInput): string {
@@ -184,6 +231,7 @@ export class WatchNotifier {
       watchId: `watch_${randomBytes(6).toString("hex")}`,
       key,
       source: input.source,
+      descriptor: input.source.descriptor ?? { kind: input.source.kind },
       sessionID: input.sessionID,
       ...(input.agent !== undefined ? { agent: input.agent } : {}),
       ...(input.name !== undefined ? { name: input.name } : {}),
@@ -214,6 +262,7 @@ export class WatchNotifier {
     };
 
     this.active.set(record.watchId, record);
+    this.persist();
     void this.run(record).catch((error) => {
       this.options.onError?.(error);
     });
@@ -225,9 +274,12 @@ export class WatchNotifier {
     if (record) {
       record.abort.abort();
       this.active.delete(watchId);
+      this.persist();
       return true;
     }
-    return this.suspended.delete(watchId);
+    const removed = this.suspended.delete(watchId);
+    if (removed) this.persist();
+    return removed;
   }
 
   list(): WatchSummary[] {
@@ -237,9 +289,9 @@ export class WatchNotifier {
   }
 
   listSuspended(): WatchSummary[] {
-    return [...this.suspended.values()].sort(
-      (left, right) => left.startedAt - right.startedAt,
-    );
+    return [...this.suspended.values()]
+      .map((watch) => this.summaryFromPersisted(watch))
+      .sort((left, right) => left.startedAt - right.startedAt);
   }
 
   /**
@@ -253,9 +305,13 @@ export class WatchNotifier {
       record.abort.abort();
       this.active.delete(record.watchId);
       const summary = this.summary(record, "suspended");
-      this.suspended.set(record.watchId, summary);
+      this.suspended.set(
+        record.watchId,
+        this.toPersisted(record, "suspended"),
+      );
       summaries.push(summary);
     }
+    this.persist();
     return summaries;
   }
 
@@ -271,6 +327,7 @@ export class WatchNotifier {
     for (const [watchId, summary] of this.suspended) {
       if (summary.jobId === jobId) this.suspended.delete(watchId);
     }
+    this.persist();
     return canceled;
   }
 
@@ -298,11 +355,87 @@ export class WatchNotifier {
     };
   }
 
-  dispose(): void {
-    for (const record of this.active.values()) record.abort.abort();
+  async dispose(): Promise<void> {
+    this.disposed = true;
+    for (const record of this.active.values()) {
+      record.abort.abort();
+      this.suspended.set(
+        record.watchId,
+        this.toPersisted(record, "suspended"),
+      );
+    }
     this.active.clear();
+    await this.persistQueue.catch(() => undefined);
+    await this.persistNow();
     this.suspended.clear();
     this.completed.clear();
+  }
+
+  private persist(): void {
+    if (this.disposed || this.options.storage === undefined) return;
+    this.persistQueue = this.persistQueue
+      .then(() => this.persistNow())
+      .catch((error) => {
+        this.options.onError?.(error);
+      });
+  }
+
+  private async persistNow(): Promise<void> {
+    if (this.options.storage === undefined) return;
+    const watches: PersistedWatch[] = [
+      ...[...this.active.values()].map((record) =>
+        this.toPersisted(record, record.state),
+      ),
+      ...this.suspended.values(),
+    ];
+    await this.options.storage.save(watches);
+  }
+
+  private toPersisted(
+    record: WatchRecord,
+    state: WatchState,
+  ): PersistedWatch {
+    return {
+      watchId: record.watchId,
+      kind: record.source.kind,
+      sessionID: record.sessionID,
+      ...(record.agent !== undefined ? { agent: record.agent } : {}),
+      ...(record.name !== undefined ? { name: record.name } : {}),
+      ...(record.hostLabel !== undefined ? { hostLabel: record.hostLabel } : {}),
+      ...(record.sshId !== undefined ? { sshId: record.sshId } : {}),
+      ...(record.jobId !== undefined ? { jobId: record.jobId } : {}),
+      descriptor: record.descriptor,
+      logLines: record.logLines,
+      watchAfterReady: record.watchAfterReady,
+      state,
+      startedAt: record.startedAt,
+      ...(state === "suspended" ? { suspendedAt: this.now() } : {}),
+      ...(record.readiness !== undefined
+        ? { readiness: record.readiness }
+        : {}),
+      ...(record.readyAt !== undefined ? { readyAt: record.readyAt } : {}),
+    };
+  }
+
+  private summaryFromPersisted(watch: PersistedWatch): WatchSummary {
+    return {
+      watchId: watch.watchId,
+      kind: watch.kind,
+      ...(watch.jobId !== undefined ? { jobId: watch.jobId } : {}),
+      ...(watch.sshId !== undefined ? { sshId: watch.sshId } : {}),
+      sessionID: watch.sessionID,
+      ...(watch.name !== undefined ? { name: watch.name } : {}),
+      ...(watch.hostLabel !== undefined ? { hostLabel: watch.hostLabel } : {}),
+      ...(watch.readiness !== undefined
+        ? { readiness: watch.readiness }
+        : {}),
+      ...(describeDescriptor(watch.descriptor) !== ""
+        ? { conditions: describeDescriptor(watch.descriptor) }
+        : {}),
+      state: "suspended",
+      suspended: true,
+      startedAt: watch.startedAt,
+    };
   }
 
   private summary(
@@ -319,6 +452,9 @@ export class WatchNotifier {
       ...(record.hostLabel !== undefined ? { hostLabel: record.hostLabel } : {}),
       ...(record.readiness !== undefined
         ? { readiness: record.readiness }
+        : {}),
+      ...(describeDescriptor(record.descriptor) !== ""
+        ? { conditions: describeDescriptor(record.descriptor) }
         : {}),
       state,
       ...(state === "suspended" ? { suspended: true } : {}),
@@ -382,6 +518,7 @@ export class WatchNotifier {
             if (!record.notified) {
               record.notified = true;
               await this.emit(record, check, "ready");
+              this.persist();
             }
             if (!record.watchAfterReady) return;
             await this.sleep(
@@ -419,6 +556,7 @@ export class WatchNotifier {
     } finally {
       this.active.delete(record.watchId);
       if (
+        !this.suspended.has(record.watchId) &&
         record.jobId !== undefined &&
         record.sshId !== undefined &&
         record.readiness !== undefined
@@ -429,6 +567,7 @@ export class WatchNotifier {
           completedAt: this.now(),
         });
       }
+      this.persist();
     }
   }
 
@@ -442,6 +581,14 @@ export class WatchNotifier {
     } else {
       record.notified = true;
     }
+
+    // Keep enough information for ssh_connect / ssh_watch_list to show the
+    // watch after an unexpected connection failure.
+    this.suspended.set(
+      record.watchId,
+      this.toPersisted(record, "suspended"),
+    );
+    this.persist();
 
     await this.emitNotice({
       event: "monitor-stopped",
@@ -593,6 +740,37 @@ export function formatWatchNotice(notice: WatchNotice): string {
 /** Backward-compatible alias for the job-focused formatter. */
 export function formatJobNotice(notice: WatchNotice): string {
   return formatWatchNotice(notice);
+}
+
+function describeDescriptor(descriptor: WatchDescriptor): string {
+  const parts: string[] = [];
+  if (descriptor.jobId !== undefined) parts.push(`job=${descriptor.jobId}`);
+  if (descriptor.pid !== undefined) parts.push(`pid=${descriptor.pid}`);
+  if (descriptor.pidFile !== undefined) {
+    parts.push(`pid_file=${descriptor.pidFile}`);
+  }
+  if (descriptor.logPath !== undefined) {
+    parts.push(`log=${descriptor.logPath}`);
+  }
+  if (descriptor.successRegex !== undefined) {
+    parts.push(`success_regex=${descriptor.successRegex}`);
+  }
+  if (descriptor.failureRegex !== undefined) {
+    parts.push(`failure_regex=${descriptor.failureRegex}`);
+  }
+  if (descriptor.readyCommand !== undefined) {
+    parts.push(`ready_command=${descriptor.readyCommand}`);
+  }
+  if (descriptor.timeoutMs !== undefined) {
+    parts.push(`timeout_ms=${descriptor.timeoutMs}`);
+  }
+  if (descriptor.sources !== undefined) {
+    for (const child of descriptor.sources) {
+      const text = describeDescriptor(child);
+      if (text !== "") parts.push(text);
+    }
+  }
+  return parts.join(", ");
 }
 
 function nextInterval(elapsed: number, initial: number, maximum: number): number {

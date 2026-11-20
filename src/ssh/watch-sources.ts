@@ -4,6 +4,7 @@ import type {
   JobReadiness,
   WatchCheck,
   WatchCheckContext,
+  WatchDescriptor,
   WatchSource,
 } from "./watch-types.js";
 
@@ -74,6 +75,19 @@ export class JobSource implements WatchSource {
 
   get readyAt(): number | undefined {
     return this.readyAtValue;
+  }
+
+  get descriptor(): WatchDescriptor {
+    return {
+      kind: "job",
+      jobId: this.options.jobId,
+      ...(this.options.readyCommand !== undefined
+        ? { readyCommand: this.options.readyCommand }
+        : {}),
+      readyTimeoutMs: this.options.readyTimeoutMs ?? 1_200_000,
+      readyIntervalMs: this.options.readyIntervalMs ?? 5_000,
+      readyStableMs: this.options.readyStableMs ?? 5_000,
+    };
   }
 
   async check(context: WatchCheckContext): Promise<WatchCheck> {
@@ -224,6 +238,22 @@ export class PidSource implements WatchSource {
     this.key = `pid:${options.sshId}:${options.pid ?? options.pidFile ?? "unknown"}`;
   }
 
+  get descriptor(): WatchDescriptor {
+    return {
+      kind: "pid",
+      ...(this.options.pid !== undefined ? { pid: this.options.pid } : {}),
+      ...(this.options.pidFile !== undefined
+        ? { pidFile: this.options.pidFile }
+        : {}),
+      ...(this.options.logPath !== undefined
+        ? { logPath: this.options.logPath }
+        : {}),
+      ...(this.options.logLines !== undefined
+        ? { logLines: this.options.logLines }
+        : {}),
+    };
+  }
+
   async check(context: WatchCheckContext): Promise<WatchCheck> {
     const pid = await this.resolvePid();
     const result = await this.options.exec({
@@ -316,6 +346,22 @@ export class LogSource implements WatchSource {
         : undefined;
   }
 
+  get descriptor(): WatchDescriptor {
+    return {
+      kind: "log",
+      logPath: this.options.logPath,
+      ...(this.options.successRegex !== undefined
+        ? { successRegex: this.options.successRegex }
+        : {}),
+      ...(this.options.failureRegex !== undefined
+        ? { failureRegex: this.options.failureRegex }
+        : {}),
+      ...(this.options.logLines !== undefined
+        ? { logLines: this.options.logLines }
+        : {}),
+    };
+  }
+
   async check(context: WatchCheckContext): Promise<WatchCheck> {
     const result = await this.options.exec({
       sshId: this.options.sshId,
@@ -391,6 +437,22 @@ export class HealthSource implements WatchSource {
 
   get readyAt(): number | undefined {
     return this.readyAtValue;
+  }
+
+  get descriptor(): WatchDescriptor {
+    return {
+      kind: "health",
+      readyCommand: this.options.readyCommand,
+      readyTimeoutMs: this.readyTimeoutMs,
+      readyIntervalMs: this.readyIntervalMs,
+      readyStableMs: this.readyStableMs,
+      ...(this.options.logPath !== undefined
+        ? { logPath: this.options.logPath }
+        : {}),
+      ...(this.options.logLines !== undefined
+        ? { logLines: this.options.logLines }
+        : {}),
+    };
   }
 
   async check(context: WatchCheckContext): Promise<WatchCheck> {
@@ -477,6 +539,10 @@ export class TimeoutSource implements WatchSource {
     this.key = `timeout:${timeoutMs}`;
   }
 
+  get descriptor(): WatchDescriptor {
+    return { kind: "timeout", timeoutMs: this.timeoutMs };
+  }
+
   async check(context: WatchCheckContext): Promise<WatchCheck> {
     const startedAt =
       this.startedAt ?? (this.startedAt = context.now);
@@ -502,6 +568,15 @@ export class CompositeSource implements WatchSource {
     if (keys.length > 0) {
       this.key = `composite:${keys.join("|")}`;
     }
+  }
+
+  get descriptor(): WatchDescriptor {
+    return {
+      kind: "composite",
+      sources: this.sources
+        .map((source) => source.descriptor)
+        .filter((descriptor): descriptor is WatchDescriptor => descriptor !== undefined),
+    };
   }
 
   async check(context: WatchCheckContext): Promise<WatchCheck> {

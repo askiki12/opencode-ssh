@@ -108,6 +108,7 @@ Use the job tools when a task should outlive one tool call (training, builds, mi
 - `ssh_job_stop` automatically cancels that job's watches before stopping it. Do not call `ssh_unwatch` first for a job.
 - `ssh_disconnect` suspends watches for that ssh_id without a `monitor-stopped` notification. Jobs may still run remotely; after reconnecting, use `ssh_watch({ ssh_id, job_id })` to reattach. `ssh_connect` reports the number of suspended watches for the target.
 - For a generic watched process that you are about to kill with `ssh_exec`, call `ssh_unwatch` first if you do not want a `pid-exited` notification.
+- Watch subscriptions persist in local `ctx.storage` (`watchSubscriptions`). After OpenCode restarts or the plugin reloads, old watches appear as `suspended`; they are not resumed automatically. Call `ssh_watch_list`, reconnect, and reattach jobs with `ssh_watch({ ssh_id, job_id })`.
 
 ## Security
 
