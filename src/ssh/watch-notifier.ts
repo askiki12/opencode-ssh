@@ -515,7 +515,9 @@ export function formatWatchNotice(notice: WatchNotice): string {
     ...(notice.pattern !== undefined ? [`pattern: ${notice.pattern}`] : []),
     "",
     notice.event === "ready"
-      ? "服务已就绪，job 仍在运行。需要停止时调用 ssh_job_stop({ ssh_id, job_id })。"
+      ? notice.jobId !== undefined
+        ? "服务已就绪，job 仍在运行。需要停止时调用 ssh_job_stop({ ssh_id, job_id })。"
+        : "服务已就绪，watch 已完成。需要停止服务时请终止对应进程（例如 kill $(cat <pid_file>)）。"
       : notice.event === "timeout"
         ? "超过超时时间仍未就绪，进程可能仍在加载或卡住。请检查日志。"
         : notice.event === "service-exited"

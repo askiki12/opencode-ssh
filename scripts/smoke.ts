@@ -1920,6 +1920,16 @@ async function main() {
     assert.equal(notices[0]?.pid, 123);
     assert.equal(notices[0]?.watchId, watchId);
     assert.match(notices[0] ? formatJobNotice(notices[0]) : "", /pid exited/);
+    const genericReady: JobNotice = {
+      event: "ready",
+      kind: "health",
+      watchId: "watch_ready",
+      sessionID: "ses_generic",
+      state: "running",
+      readiness: "ready",
+    };
+    assert.match(formatJobNotice(genericReady), /终止对应进程/);
+    assert.doesNotMatch(formatJobNotice(genericReady), /ssh_job_stop/);
     notifier.dispose();
   }
 
