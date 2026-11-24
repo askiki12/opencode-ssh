@@ -67,8 +67,8 @@ Rules that matter:
 - Paths must be absolute or start with `~/`; relative paths are rejected.
 - `ssh_write` refuses to overwrite unless `overwrite: true` is passed deliberately.
 - `ssh_write` / `ssh_edit` refuse symbolic links. They preserve POSIX mode, but ownership may become the SSH user and ACL/xattr are not guaranteed. `ssh_transfer` rejects symlinks in both directions; `ssh_remove` deletes a link itself, not its target.
-- `ssh_write` reports `line_endings`; CRLF is written byte-for-byte and warned about. Use LF for Linux shell scripts and cron entries.
-- `ssh_edit` fails when `old_text` matches more than once unless `replace_all: true`.
+- `ssh_write` reports `line_endings`; CRLF is written byte-for-byte and warned about. Use LF for Linux shell scripts and cron entries. `content` may be empty to create an empty file.
+- `ssh_edit` fails when `old_text` matches more than once unless `replace_all: true`. `old_text` must not be empty; `new_text` may be empty (delete the match) or whitespace-only.
 - `ssh_read` reports `line_endings` and, for a complete file, its SHA-256. Pass that hash as `ssh_edit`'s `expected_sha256` to prevent overwriting a file changed by another process. `ssh_edit` also returns SHA-256 before/after. Matching is exact, including CRLF.
 - Before deleting a directory, call `ssh_remove` with `dry_run: true`, then repeat with `recursive: true`.
 - Write, edit, remove, and transfer trigger a path-level permission prompt; read, glob, and grep do not.

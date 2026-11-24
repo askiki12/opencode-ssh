@@ -328,8 +328,8 @@ sudo 示例（需要 profile 或连接上保存了 `sudo_password`）：
 - `ssh_write` / `ssh_edit` 会拒绝 symlink，避免原子替换把链接变成普通文件；需要编辑链接目标时，先解析真实路径并重新授权。`ssh_remove` 删除 symlink 时只删除链接本身，不删除目标。
 - `ssh_write` / `ssh_edit` 保留 POSIX mode，但原子替换会把 inode ownership 变为 SSH 用户，ACL/xattr 不保证保留。
 - `ssh_read` 会报告 `line_endings`；读取完整文件时还返回 SHA-256，可用于 `ssh_edit` 的 `expected_sha256`。分段读取时 `sha256` 为 null。
-- `ssh_edit` 支持 `expected_sha256`，并在结果中返回修改前后 SHA-256。匹配是精确的：CRLF 文件需要 `old_text` 包含 `\r\n`，工具会给出提示但不会做模糊匹配。
-- `ssh_write` 按字节原样写入并报告 `line_endings`；内容含 CRLF 时会警告，因为 Linux shell 脚本和 cron 条目通常要求 LF。
+- `ssh_edit` 支持 `expected_sha256`，并在结果中返回修改前后 SHA-256。匹配是精确的：CRLF 文件需要 `old_text` 包含 `\r\n`，工具会给出提示但不会做模糊匹配。`old_text` 不能为空；`new_text` 可以为空或纯空白，空字符串表示删除匹配到的文本。
+- `ssh_write` 按字节原样写入并报告 `line_endings`；`content` 可以为空字符串（创建空文件）。内容含 CRLF 时会警告，因为 Linux shell 脚本和 cron 条目通常要求 LF。
 - `ssh_grep` / `ssh_glob` 默认跳过搜索根之下的隐藏项、`.git`、`node_modules`；显式把隐藏目录或 `.git`/`node_modules` 作为根时会按原路径搜索。需要隐藏项时设置 `include_hidden: true`；ripgrep 可用时默认遵守 `.gitignore` / `.ignore`，`include_ignored: true` 放开。
 - `ssh_glob` 使用路径 glob：`*.ts` 只匹配根层，递归请用 `**/*.ts`；只返回普通文件，不跟随符号链接。`ssh_grep` 的 `include` 是文件名 glob（例如 `*.ts`），包含 `/` 会被拒绝，目录范围由 `path` 控制。
 - `ssh_grep` 需要远端有 `rg` 或 `grep`；`ssh_glob` 优先 `rg`/`find`，最后回退 SFTP。`ssh_grep` 两者都没有时会明确报错，并提示可以用 `ssh_exec` 安装 ripgrep。

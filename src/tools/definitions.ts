@@ -257,7 +257,7 @@ const WRITE_INPUT = {
     path: PATH_SCHEMA,
     content: {
       type: "string",
-      description: "Full file content to write as UTF-8.",
+      description: "Full file content to write as UTF-8. May be empty to create an empty file.",
     },
     overwrite: {
       type: "boolean",
@@ -280,11 +280,12 @@ const EDIT_INPUT = {
     old_text: {
       type: "string",
       description:
-        "Exact text to replace. Must occur exactly once unless replace_all is true.",
+        "Exact text to replace. Must not be empty and must occur exactly once unless replace_all is true.",
     },
     new_text: {
       type: "string",
-      description: "Replacement text.",
+      description:
+        "Replacement text. May be empty to delete the matched text, and may be whitespace-only.",
     },
     replace_all: {
       type: "boolean",
@@ -932,7 +933,7 @@ export function createSshTools(
         "Write a complete remote file as UTF-8 using an atomic temp-file rename. " +
         "Parent directories are created automatically. " +
         "By default an existing file is an error; pass overwrite: true to replace it, " +
-        "or use ssh_edit for a targeted change. Content is written byte-for-byte: line endings are preserved and reported; CRLF may break Linux scripts/cron. " +
+        "or use ssh_edit for a targeted change. Content may be empty to create an empty file. Content is written byte-for-byte: line endings are preserved and reported; CRLF may break Linux scripts/cron. " +
         "POSIX mode is preserved; ownership may become the SSH user, and ACL/xattr are not guaranteed. Refuses symbolic links.",
       input: WRITE_INPUT,
       options: { namespace: "ssh", codemode: true },
@@ -950,7 +951,7 @@ export function createSshTools(
         const result = await writeRemoteFile(
           sftp,
           target,
-          requireString(input.content, "content"),
+          requireRawString(input.content, "content"),
           {
             ...(input.overwrite !== undefined
               ? { overwrite: requireBoolean(input.overwrite, "overwrite") }
@@ -982,7 +983,8 @@ export function createSshTools(
       description:
         "Replace exact text in a remote file and write it atomically. " +
         "old_text must occur exactly once unless replace_all is true; otherwise the edit fails " +
-        "so an ambiguous change is never applied. Matching is exact, including line endings (CRLF files need \\r\\n in old_text). " +
+        "so an ambiguous change is never applied. old_text must not be empty; new_text may be empty to delete the matched text. " +
+        "Matching is exact, including line endings (CRLF files need \\r\\n in old_text). " +
         "Returns SHA-256 before/after; expected_sha256 rejects the edit if the file changed after reading. " +
         "POSIX mode is preserved; ownership may become the SSH user, and ACL/xattr are not guaranteed. Refuses symbolic links.",
       input: EDIT_INPUT,
@@ -990,6 +992,13 @@ export function createSshTools(
       execute: async (raw, context) => {
         const input = asRecord(raw);
         const sshId = requireString(input.ssh_id, "ssh_id");
+        const oldText = requireRawString(input.old_text, "old_text");
+        if (oldText.length === 0) {
+          throw new Error("old_text must not be empty.");
+        }
+        // Empty and whitespace-only replacements are legitimate: an empty
+        // string deletes the matched text.
+        const newText = requireRawString(input.new_text, "new_text");
         const target = await resolveTargetPath(
           dependencies.manager,
           sshId,
@@ -1001,8 +1010,8 @@ export function createSshTools(
         const result = await editRemoteFile(
           sftp,
           target,
-          requireString(input.old_text, "old_text"),
-          requireString(input.new_text, "new_text"),
+          oldText,
+          newText,
           {
             ...(input.replace_all !== undefined
               ? { replaceAll: requireBoolean(input.replace_all, "replace_all") }
@@ -2034,6 +2043,18 @@ function asRecord(value: unknown): Record<string, unknown> {
 function requireString(value: unknown, field: string): string {
   if (typeof value !== "string" || value.trim().length === 0) {
     throw new Error(`${field} must be a non-empty string.`);
+  }
+  return value;
+}
+
+/**
+ * Validate a string field where empty and whitespace-only content is
+ * meaningful, such as file content or replacement text. Anything else (a
+ * number, null, an object) is still rejected.
+ */
+function requireRawString(value: unknown, field: string): string {
+  if (typeof value !== "string") {
+    throw new Error(`${field} must be a string.`);
   }
   return value;
 }

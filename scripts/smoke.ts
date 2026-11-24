@@ -826,6 +826,40 @@ async function main() {
     );
     assert.equal(crlfWrite.lineEndings, "crlf");
 
+    // Deleting text (empty replacement) and clearing a file are legitimate:
+    // the core edit/write layer must accept empty and whitespace-only content.
+    const deletedLine = await editRemoteFile(
+      sftp,
+      "/project/hello.txt",
+      "Two\n",
+      "",
+    );
+    assert.equal(deletedLine.replacements, 1);
+    assert.deepEqual(
+      (await readRemoteFile(sftp, "/project/hello.txt")).lines.map(
+        (line) => line.text,
+      ),
+      ["ONE", "Three four"],
+    );
+    const blankedText = await editRemoteFile(
+      sftp,
+      "/project/hello.txt",
+      "Three four",
+      "   ",
+    );
+    assert.equal(blankedText.replacements, 1);
+    const emptied = await writeRemoteFile(sftp, "/project/empty.txt", "");
+    assert.equal(emptied.bytes, 0);
+    assert.equal(emptied.created, true);
+    assert.equal(
+      (await readRemoteFile(sftp, "/project/empty.txt")).lines.length,
+      0,
+    );
+    await assert.rejects(
+      editRemoteFile(sftp, "/project/hello.txt", "", "x"),
+      /old_text must not be empty/,
+    );
+
     const binaryPath = "/project/data.bin";
     writeFileSync(path.join(fileRoot, "project", "data.bin"), Buffer.from([1, 0, 2]));
     const binary = await readRemoteFile(sftp, binaryPath);
@@ -1608,6 +1642,100 @@ async function main() {
       throw new Error("expected a ToolError for an invalid include glob");
     }
     assert.equal(invalidGrepToolError.metadata?.errorCode, "SSH_INVALID_INPUT");
+
+    // Tool-level validation must accept empty new_text/content while still
+    // rejecting an empty old_text.
+    const editRoot = mkdtempSync(
+      path.join(tmpdir(), "opencode-ssh-edit-tool-"),
+    );
+    try {
+      const editSftp = createFakeSftp(editRoot);
+      const fileTools = new Map(
+        createSshTools({
+          manager: {
+            sftp: async () => editSftp,
+          } as unknown as ConnectionManager,
+          profiles,
+          config,
+          search: new SearchService({} as ConnectionManager),
+          jobs: {} as JobService,
+        }).map((tool) => [tool.name, tool]),
+      );
+      const emptyWrite = await requiredTool(fileTools, "write").execute(
+        { ssh_id: "ssh_test", path: "/empty.txt", content: "" },
+        context,
+      );
+      assert.match(emptyWrite.content, /bytes: 0/);
+      assert.equal(readFileSync(path.join(editRoot, "empty.txt"), "utf8"), "");
+
+      await requiredTool(fileTools, "write").execute(
+        {
+          ssh_id: "ssh_test",
+          path: "/lines.txt",
+          content: "keep\ndrop\n",
+        },
+        context,
+      );
+      const deleted = await requiredTool(fileTools, "edit").execute(
+        {
+          ssh_id: "ssh_test",
+          path: "/lines.txt",
+          old_text: "drop\n",
+          new_text: "",
+        },
+        context,
+      );
+      assert.match(deleted.content, /replacements: 1/);
+      assert.equal(
+        readFileSync(path.join(editRoot, "lines.txt"), "utf8"),
+        "keep\n",
+      );
+
+      const blanked = await requiredTool(fileTools, "edit").execute(
+        {
+          ssh_id: "ssh_test",
+          path: "/lines.txt",
+          old_text: "keep",
+          new_text: "   ",
+        },
+        context,
+      );
+      assert.match(blanked.content, /replacements: 1/);
+      assert.equal(
+        readFileSync(path.join(editRoot, "lines.txt"), "utf8"),
+        "   \n",
+      );
+
+      await assert.rejects(
+        () =>
+          requiredTool(fileTools, "edit").execute(
+            {
+              ssh_id: "ssh_test",
+              path: "/lines.txt",
+              old_text: "",
+              new_text: "x",
+            },
+            context,
+          ),
+        /old_text must not be empty/,
+      );
+
+      await assert.rejects(
+        () =>
+          requiredTool(fileTools, "edit").execute(
+            {
+              ssh_id: "ssh_test",
+              path: "/lines.txt",
+              old_text: "keep",
+              new_text: 42 as unknown as string,
+            },
+            context,
+          ),
+        /new_text must be a string/,
+      );
+    } finally {
+      rmSync(editRoot, { recursive: true, force: true });
+    }
 
     const connectResult = await requiredTool(byName, "connect").execute(
       {
