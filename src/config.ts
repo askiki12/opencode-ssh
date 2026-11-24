@@ -17,6 +17,22 @@ export interface SshPluginOptions {
   keepaliveIntervalMs?: number;
   /** Default policy for unknown host keys. */
   hostKeyPolicy?: HostKeyPolicy;
+  /** Poll interval for watch targets. */
+  watchIntervalMs?: number;
+  /** Maximum backoff interval for a watch whose target is unreachable. */
+  watchMaxIntervalMs?: number;
+  /** Consecutive probe failures before a watch reports the target as lost. */
+  watchMaxFailures?: number;
+  /** How long detached or terminal watches are retained for inspection. */
+  watchTtlMs?: number;
+  /** Maximum bytes scanned from a remote log per poll. */
+  watchLogScanBytes?: number;
+  /** Default readiness timeout for service targets. */
+  watchReadyTimeoutMs?: number;
+  /** Default readiness probe interval for service targets. */
+  watchReadyIntervalMs?: number;
+  /** Time a readiness probe must stay successful before a target is ready. */
+  watchReadyStableMs?: number;
 }
 
 export interface ResolvedConfig {
@@ -27,6 +43,14 @@ export interface ResolvedConfig {
   execTimeoutMs: number;
   keepaliveIntervalMs: number;
   hostKeyPolicy: HostKeyPolicy;
+  watchIntervalMs: number;
+  watchMaxIntervalMs: number;
+  watchMaxFailures: number;
+  watchTtlMs: number;
+  watchLogScanBytes: number;
+  watchReadyTimeoutMs: number;
+  watchReadyIntervalMs: number;
+  watchReadyStableMs: number;
 }
 
 const POLICIES: ReadonlySet<string> = new Set(["accept-new", "strict", "insecure"]);
@@ -81,6 +105,56 @@ export function resolveConfig(
       10 * 60 * 1000,
     ),
     hostKeyPolicy: hostKeyPolicy as HostKeyPolicy,
+    watchIntervalMs: numberOption(
+      options,
+      "watchIntervalMs",
+      5_000,
+      100,
+      5 * 60 * 1000,
+    ),
+    watchMaxIntervalMs: numberOption(
+      options,
+      "watchMaxIntervalMs",
+      60_000,
+      1_000,
+      60 * 60 * 1000,
+    ),
+    watchMaxFailures: numberOption(options, "watchMaxFailures", 5, 1, 100),
+    watchTtlMs: numberOption(
+      options,
+      "watchTtlMs",
+      30 * 60 * 1000,
+      60 * 1000,
+      7 * 24 * 60 * 60 * 1000,
+    ),
+    watchLogScanBytes: numberOption(
+      options,
+      "watchLogScanBytes",
+      256 * 1024,
+      4 * 1024,
+      8 * 1024 * 1024,
+    ),
+    watchReadyTimeoutMs: numberOption(
+      options,
+      "watchReadyTimeoutMs",
+      20 * 60 * 1000,
+      1_000,
+      24 * 60 * 60 * 1000,
+    ),
+    watchReadyIntervalMs: numberOption(
+      options,
+      "watchReadyIntervalMs",
+      5_000,
+      100,
+      5 * 60 * 1000,
+    ),
+    watchReadyStableMs: numberOption(
+      options,
+      "watchReadyStableMs",
+      5_000,
+      0,
+      10 * 60 * 1000,
+    ),
   };
 }
 

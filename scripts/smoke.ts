@@ -35,6 +35,7 @@ import {
   buildLaunchCommand,
   type JobConnections,
   type JobInfo,
+  type JobState,
 } from "../src/ssh/jobs.js";
 import { SshOperationError } from "../src/ssh/errors.js";
 import {
@@ -45,6 +46,8 @@ import {
 } from "../src/ssh/manager.js";
 import { compileGlob, InvalidGlobPatternError } from "../src/ssh/glob.js";
 import { SearchService } from "../src/ssh/search.js";
+import { formatWatchNotice, WatchService } from "../src/ssh/watch.js";
+import type { WatchNotice } from "../src/ssh/watch-types.js";
 import { createSshTools, type ToolDefinition } from "../src/tools/definitions.js";
 import { OutputCollector } from "../src/util.js";
 import { createFakeSftp } from "./fake-sftp.js";
@@ -1550,12 +1553,26 @@ async function main() {
     }
 
     const permissionRequests: Array<{ resource: string }> = [];
+    const watchService = new WatchService({
+      manager,
+      jobs: new JobService(manager),
+      intervalMs: 50,
+      maxIntervalMs: 200,
+      maxFailures: 3,
+      ttlMs: 60_000,
+      logScanBytes: 64 * 1024,
+      readyTimeoutMs: 5_000,
+      readyIntervalMs: 50,
+      readyStableMs: 0,
+      notify: async () => undefined,
+    });
     const tools = createSshTools({
       manager,
       profiles,
       config,
       search: new SearchService(manager),
       jobs: new JobService(manager),
+      watches: watchService,
       assertPermission: async (request) => {
         permissionRequests.push({ resource: request.resource });
       },
@@ -1591,6 +1608,7 @@ async function main() {
           }),
         } as unknown as SearchService,
         jobs: {} as JobService,
+        watches: {} as WatchService,
       }).map((tool) => [tool.name, tool]),
     );
     const noHomeGlobResult = await requiredTool(noHomeTools, "glob").execute(
@@ -1614,6 +1632,7 @@ async function main() {
         config,
         search: new SearchService({} as ConnectionManager),
         jobs: {} as JobService,
+        watches: {} as WatchService,
       }).map((tool) => [tool.name, tool]),
     );
     const invalidGlobToolError = await requiredTool(invalidTools, "glob")
@@ -1659,6 +1678,7 @@ async function main() {
           config,
           search: new SearchService({} as ConnectionManager),
           jobs: {} as JobService,
+          watches: {} as WatchService,
         }).map((tool) => [tool.name, tool]),
       );
       const emptyWrite = await requiredTool(fileTools, "write").execute(
@@ -1926,6 +1946,13 @@ async function main() {
       await unknownServer.close();
     }
 
+    watchService.dispose();
+    await runWatchServiceSmoke();
+    await runWatchLogSmoke();
+    await runWatchDisconnectSmoke();
+    await runWatchJobStopSmoke();
+    await runWatchToolSmoke(profiles, config);
+
     assert.equal(manager.list().length, 0);
     assert.throws(() => manager.getInfo(connection.id), /No active SSH connection/);
   } finally {
@@ -1945,6 +1972,853 @@ main()
   .finally(() => {
     rmSync(dataDir, { recursive: true, force: true });
   });
+
+async function runWatchServiceSmoke(): Promise<void> {
+  const states = new Map<string, { state: JobState; exitCode?: number | null }>([
+    ["job_a", { state: "running" }],
+    ["job_b", { state: "running" }],
+    ["job_c", { state: "running" }],
+    ["job_d", { state: "running" }],
+  ]);
+  const fakeJobs = {
+    status: async (_sshId: string, jobId: string) => {
+      const entry = states.get(jobId);
+      if (entry === undefined) throw new Error(`missing job ${jobId}`);
+      return {
+        jobId,
+        state: entry.state,
+        ...(entry.exitCode !== undefined ? { exitCode: entry.exitCode } : {}),
+        jobDir: `/jobs/${jobId}`,
+        logPath: `/jobs/${jobId}/output.log`,
+      } as JobInfo;
+    },
+  } as unknown as JobService;
+  const fakeManager = {
+    homeDir: async () => "/home/test",
+    exec: async (input: { command: string }) => {
+      if (input.command.startsWith("wc -c")) {
+        return fakeExecResult("0\n");
+      }
+      if (input.command.startsWith("tail -n")) {
+        return fakeExecResult("");
+      }
+      if (input.command.includes("ready-ok")) {
+        return fakeExecResult("ok\n");
+      }
+      return fakeExecResult("");
+    },
+  } as unknown as ConnectionManager;
+
+  const notices: WatchNotice[] = [];
+  const service = new WatchService({
+    manager: fakeManager,
+    jobs: fakeJobs,
+    intervalMs: 10,
+    maxIntervalMs: 30,
+    maxFailures: 3,
+    ttlMs: 60_000,
+    logScanBytes: 64 * 1024,
+    readyTimeoutMs: 5_000,
+    readyIntervalMs: 10,
+    readyStableMs: 0,
+    notify: async (notice) => {
+      notices.push(notice);
+    },
+  });
+
+  try {
+    const base = {
+      sessionID: "ses_watch_a",
+      mode: "all" as const,
+      failFast: true,
+      notify: { logLines: 10, logScope: "failed" as const },
+    };
+    const created = await service.createNotifier({
+      ...base,
+      targets: [
+        { kind: "job", sshId: "ssh_test", jobId: "job_a", watchAfterReady: false },
+        { kind: "job", sshId: "ssh_test", jobId: "job_b", watchAfterReady: false },
+      ],
+      watchIds: [],
+    });
+    assert.equal(created.watches.length, 2);
+    assert.equal(created.notifier.state, "watching");
+    const watchA = created.watches[0];
+    const watchB = created.watches[1];
+    assert.ok(watchA && watchB);
+
+    await assert.rejects(
+      () =>
+        service.createNotifier({
+          ...base,
+          targets: [
+            {
+              kind: "job",
+              sshId: "ssh_test",
+              jobId: "job_a",
+              logPath: "/other.log",
+              watchAfterReady: false,
+            },
+          ],
+          watchIds: [],
+        }),
+      /different conditions/,
+    );
+
+    states.set("job_a", { state: "finished", exitCode: 1 });
+    await waitFor(() => notices.length >= 1);
+    assert.equal(notices[0]?.event, "failed");
+    assert.deepEqual(notices[0]?.remainingWatchIds, [watchB.watchId]);
+    assert.match(formatWatchNotice(notices[0]!), /\[ssh watch failed\]/);
+    assert.match(formatWatchNotice(notices[0]!), /remaining watches/);
+
+    const afterFailure = service.list("ses_watch_a");
+    const detached = afterFailure.watches.find(
+      (watch) => watch.watchId === watchB.watchId,
+    );
+    assert.equal(detached?.lifecycle, "detached");
+    assert.equal(detached?.refCount, 0);
+
+    const reused = await service.createNotifier({
+      ...base,
+      targets: [],
+      watchIds: [watchB.watchId],
+    });
+    assert.deepEqual(reused.notifier.watchIds, [watchB.watchId]);
+    states.set("job_b", { state: "finished", exitCode: 0 });
+    await waitFor(() => notices.length >= 2);
+    assert.equal(notices[1]?.event, "completed");
+    assert.deepEqual(notices[1]?.remainingWatchIds, []);
+
+    const readyOnly = await service.createNotifier({
+      ...base,
+      targets: [
+        {
+          kind: "job",
+          sshId: "ssh_test",
+          jobId: "job_c",
+          watchAfterReady: false,
+          ready: {
+            command: "ready-ok",
+            timeoutMs: 2_000,
+            intervalMs: 10,
+            stableMs: 0,
+          },
+        },
+      ],
+      watchIds: [],
+    });
+    await waitFor(() => notices.length >= 3);
+    assert.equal(notices[2]?.event, "ready");
+    assert.equal(notices[2]?.state, "completed");
+    const readyWatch = service.list("ses_watch_a", {
+      watchId: readyOnly.watches[0]!.watchId,
+    }).watches[0];
+    assert.equal(readyWatch?.lifecycle, "completed");
+    assert.equal(readyWatch?.targetState, "ready");
+
+    const otherSession = await service.createNotifier({
+      ...base,
+      sessionID: "ses_watch_b",
+      targets: [
+        { kind: "job", sshId: "ssh_test", jobId: "job_d", watchAfterReady: false },
+      ],
+      watchIds: [],
+    });
+    assert.equal(otherSession.watches.length, 1);
+    assert.notEqual(otherSession.watches[0]?.watchId, watchA.watchId);
+
+    const filtered = service.list("ses_watch_b", {
+      notifierId: otherSession.notifier.notifierId,
+    });
+    assert.equal(filtered.watches.length, 1);
+    assert.equal(filtered.watches[0]?.watchId, otherSession.watches[0]?.watchId);
+
+    const single = service.list("ses_watch_a", { watchId: watchB.watchId });
+    assert.equal(single.watches.length, 1);
+    assert.equal(single.watches[0]?.lifecycle, "completed");
+
+    assert.equal(
+      service.unwatchNotifier("ses_watch_b", otherSession.notifier.notifierId)
+        .removed,
+      true,
+    );
+    assert.equal(
+      service.destroyWatch("ses_watch_b", otherSession.watches[0]!.watchId)
+        .removed,
+      true,
+    );
+    assert.equal(
+      service.destroyWatch("ses_watch_a", watchB.watchId).removed,
+      true,
+    );
+  } finally {
+    service.dispose();
+  }
+
+  let alive = true;
+  const processManager = {
+    homeDir: async () => "/home/test",
+    exec: async (input: { command: string }) => {
+      const command = input.command;
+      if (command.startsWith("cat --") && command.includes("/run/svc.pid")) {
+        return fakeExecResult("4321\n");
+      }
+      if (command.startsWith("ps -p 4321 -o pid=")) {
+        return alive ? fakeExecResult("4321\n") : fakeExecResult("", 1);
+      }
+      if (command.startsWith("ps -p 4321 -o lstart=")) {
+        return alive
+          ? fakeExecResult("Mon Jan  1 00:00:00 2026\n")
+          : fakeExecResult("", 1);
+      }
+      if (command.startsWith("wc -c")) {
+        return fakeExecResult("0\n");
+      }
+      if (command.startsWith("tail -n")) {
+        return fakeExecResult("");
+      }
+      if (command.includes("ready-ok")) {
+        return fakeExecResult("ok\n");
+      }
+      return fakeExecResult("");
+    },
+  } as unknown as ConnectionManager;
+  const processNotices: WatchNotice[] = [];
+  const processService = new WatchService({
+    manager: processManager,
+    jobs: fakeJobs,
+    intervalMs: 10,
+    maxIntervalMs: 30,
+    maxFailures: 3,
+    ttlMs: 60_000,
+    logScanBytes: 64 * 1024,
+    readyTimeoutMs: 2_000,
+    readyIntervalMs: 10,
+    readyStableMs: 0,
+    notify: async (notice) => {
+      processNotices.push(notice);
+    },
+  });
+  try {
+    await processService.createNotifier({
+      sessionID: "ses_watch_proc",
+      mode: "all",
+      failFast: true,
+      notify: { logLines: 10, logScope: "failed" },
+      watchIds: [],
+      targets: [
+        {
+          kind: "process",
+          sshId: "ssh_proc",
+          pidFile: "/run/svc.pid",
+          logPath: "/var/log/svc.log",
+          ready: {
+            command: "ready-ok",
+            timeoutMs: 2_000,
+            intervalMs: 10,
+            stableMs: 0,
+          },
+          failure: { regex: "FATAL" },
+          watchAfterReady: true,
+        },
+      ],
+    });
+    await waitFor(() => processNotices.length >= 1);
+    assert.equal(processNotices[0]?.event, "ready");
+    alive = false;
+    await waitFor(() => processNotices.length >= 2);
+    assert.equal(processNotices[1]?.event, "failed");
+    assert.match(
+      processNotices[1]?.targets[0]?.message ?? "",
+      /service exited/,
+    );
+  } finally {
+    processService.dispose();
+  }
+}
+
+async function runWatchToolSmoke(
+  profiles: ProfileStore,
+  config: ReturnType<typeof resolveConfig>,
+): Promise<void> {
+  const states = new Map<string, { state: JobState; exitCode?: number | null }>([
+    ["job_tool", { state: "running" }],
+    ["job_stop_tool", { state: "running" }],
+  ]);
+  const fakeJobs = {
+    stop: async (_sshId: string, jobId: string) => ({
+      jobId,
+      outcome: "stopped" as const,
+      pid: 4321,
+    }),
+    status: async (_sshId: string, jobId: string) => {
+      const entry = states.get(jobId);
+      if (entry === undefined) throw new Error(`missing job ${jobId}`);
+      return {
+        jobId,
+        state: entry.state,
+        ...(entry.exitCode !== undefined ? { exitCode: entry.exitCode } : {}),
+        jobDir: `/jobs/${jobId}`,
+        logPath: `/jobs/${jobId}/output.log`,
+      } as JobInfo;
+    },
+  } as unknown as JobService;
+  const fakeManager = {
+    homeDir: async () => "/home/test",
+    exec: async (input: { command: string }) => {
+      if (input.command.startsWith("wc -c")) return fakeExecResult("0\n");
+      if (input.command.startsWith("tail -n")) return fakeExecResult("");
+      return fakeExecResult("");
+    },
+  } as unknown as ConnectionManager;
+  const notices: WatchNotice[] = [];
+  const service = new WatchService({
+    manager: fakeManager,
+    jobs: fakeJobs,
+    intervalMs: 10,
+    maxIntervalMs: 30,
+    maxFailures: 3,
+    ttlMs: 60_000,
+    logScanBytes: 64 * 1024,
+    readyTimeoutMs: 5_000,
+    readyIntervalMs: 10,
+    readyStableMs: 0,
+    notify: async (notice) => {
+      notices.push(notice);
+    },
+  });
+  try {
+    const tools = new Map(
+      createSshTools({
+        manager: fakeManager,
+        profiles,
+        config,
+        search: {} as SearchService,
+        jobs: fakeJobs,
+        watches: service,
+      }).map((tool) => [tool.name, tool]),
+    );
+    const context = {
+      sessionID: "ses_watch_tool",
+      agent: "build",
+      messageID: "msg_watch",
+      id: "call_watch",
+      signal: new AbortController().signal,
+      progress: async () => undefined,
+    };
+
+    await assert.rejects(
+      () => requiredTool(tools, "watch").execute({}, context),
+      /requires at least one target or watch_id/,
+    );
+    await assert.rejects(
+      () => requiredTool(tools, "unwatch").execute({}, context),
+      /exactly one of notifier_id or watch_id/,
+    );
+    await assert.rejects(
+      () =>
+        requiredTool(tools, "watch_list").execute(
+          { notifier_id: "n", watch_id: "w" },
+          context,
+        ),
+      /either notifier_id or watch_id/,
+    );
+    await assert.rejects(
+      () =>
+        requiredTool(tools, "watch").execute(
+          {
+            targets: [
+              {
+                kind: "process",
+                ssh_id: "ssh_tool",
+                pid: 1,
+                pid_file: "/run/x.pid",
+              },
+            ],
+          },
+          context,
+        ),
+      /exactly one of pid or pid_file/,
+    );
+    await assert.rejects(
+      () =>
+        requiredTool(tools, "watch").execute(
+          {
+            targets: [
+              {
+                kind: "process",
+                ssh_id: "ssh_tool",
+                pid: 1,
+                failure: { exit_code: 1 },
+              },
+            ],
+          },
+          context,
+        ),
+      /cannot use exit_code/,
+    );
+    await assert.rejects(
+      () =>
+        requiredTool(tools, "watch").execute(
+          {
+            targets: [
+              {
+                kind: "job",
+                ssh_id: "ssh_tool",
+                job_id: "job_tool",
+                pid: 1,
+              },
+            ],
+          },
+          context,
+        ),
+      /pid and pid_file are only valid for process/,
+    );
+    await assert.rejects(
+      () =>
+        requiredTool(tools, "watch").execute(
+          {
+            targets: [
+              {
+                kind: "job",
+                ssh_id: "ssh_tool",
+                job_id: "job_tool",
+                watch_after_ready: true,
+              },
+            ],
+          },
+          context,
+        ),
+      /requires .*ready/,
+    );
+    await assert.rejects(
+      () =>
+        requiredTool(tools, "watch").execute(
+          {
+            targets: [
+              {
+                kind: "process",
+                ssh_id: "ssh_tool",
+                pid: 1,
+                log_path: "relative.log",
+                failure: { regex: "E" },
+              },
+            ],
+          },
+          context,
+        ),
+      /absolute or start with/,
+    );
+
+    const created = await requiredTool(tools, "watch").execute(
+      {
+        targets: [
+          {
+            kind: "job",
+            ssh_id: "ssh_tool",
+            job_id: "job_tool",
+            name: "tool job",
+          },
+        ],
+      },
+      context,
+    );
+    assert.match(created.content, /Notifier created: notifier_/);
+    assert.match(created.content, /lifecycle=active/);
+    const watchId = (created.metadata?.watchIds as string[])[0];
+    assert.equal(typeof watchId, "string");
+
+    states.set("job_tool", { state: "finished", exitCode: 0 });
+    await waitFor(() => notices.length >= 1);
+    assert.equal(notices[0]?.event, "completed");
+
+    const listed = await requiredTool(tools, "watch_list").execute({}, context);
+    assert.match(listed.content, /lifecycle=completed/);
+    const detail = await requiredTool(tools, "watch_list").execute(
+      { watch_id: watchId },
+      context,
+    );
+    assert.match(detail.content, /watch:/);
+    assert.match(detail.content, /last_known_target_state: exited/);
+
+    const removed = await requiredTool(tools, "unwatch").execute(
+      { watch_id: watchId },
+      context,
+    );
+    assert.match(removed.content, /Watch destroyed/);
+
+    // ssh_job_stop must silently cancel watches without adding a notice.
+    const stopWatch = await requiredTool(tools, "watch").execute(
+      {
+        targets: [
+          {
+            kind: "job",
+            ssh_id: "ssh_tool",
+            job_id: "job_stop_tool",
+          },
+        ],
+      },
+      context,
+    );
+    const stopWatchId = (stopWatch.metadata?.watchIds as string[])[0];
+    const stopped = await requiredTool(tools, "job_stop").execute(
+      { ssh_id: "ssh_tool", job_id: "job_stop_tool" },
+      context,
+    );
+    assert.match(stopped.content, /no notification was sent/);
+    assert.equal(notices.length, 1);
+    const stoppedWatch = await requiredTool(tools, "watch_list").execute(
+      { watch_id: stopWatchId },
+      context,
+    );
+    assert.match(stoppedWatch.content, /lifecycle: canceled/);
+    assert.match(stoppedWatch.content, /last_known_target_state: stopped/);
+  } finally {
+    service.dispose();
+  }
+}
+
+
+async function runWatchLogSmoke(): Promise<void> {
+  let log = "starting\n";
+  const jobs = {
+    status: async () => ({
+      jobId: "job_log",
+      state: "running" as JobState,
+      jobDir: "/jobs/job_log",
+      logPath: "/jobs/job_log/output.log",
+    } as JobInfo),
+  } as unknown as JobService;
+  const manager = {
+    homeDir: async () => "/home/test",
+    exec: async (input: { command: string }) => {
+      const command = input.command;
+      if (command.startsWith("wc -c")) {
+        return fakeExecResult(`${Buffer.byteLength(log)}\n`);
+      }
+      if (command.startsWith("size=$(wc -c")) {
+        const match = /tail -c \+\$\(\( (\d+) \+ 1 \)\)/.exec(command);
+        const previous = match === null ? 0 : Number(match[1]);
+        return fakeExecResult(
+          `${Buffer.byteLength(log)}\n${log.slice(previous)}`,
+        );
+      }
+      if (command.startsWith("tail -n")) return fakeExecResult(log);
+      if (command.includes("ready-ok")) return fakeExecResult("");
+      return fakeExecResult("");
+    },
+  } as unknown as ConnectionManager;
+  const notices: WatchNotice[] = [];
+  const service = new WatchService({
+    manager,
+    jobs,
+    intervalMs: 10,
+    maxIntervalMs: 30,
+    maxFailures: 3,
+    ttlMs: 60_000,
+    logScanBytes: 64 * 1024,
+    readyTimeoutMs: 5_000,
+    readyIntervalMs: 10,
+    readyStableMs: 0,
+    notify: async (notice) => {
+      notices.push(notice);
+    },
+  });
+  try {
+    await service.createNotifier({
+      sessionID: "ses_watch_log",
+      mode: "all",
+      failFast: true,
+      notify: { logLines: 10, logScope: "failed" },
+      watchIds: [],
+      targets: [
+        {
+          kind: "job",
+          sshId: "ssh_log",
+          jobId: "job_log",
+          failure: { regex: "ERROR" },
+          watchAfterReady: false,
+        },
+      ],
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    log += "all good\n";
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(notices.length, 0);
+    log += "ERROR boom\n";
+    await waitFor(() => notices.length >= 1);
+    assert.equal(notices[0]?.event, "failed");
+    assert.match(
+      notices[0]?.targets[0]?.message ?? "",
+      /failure regex/,
+    );
+    assert.match(notices[0]?.targets[0]?.logTail ?? "", /ERROR boom/);
+  } finally {
+    service.dispose();
+  }
+}
+
+
+async function runWatchDisconnectSmoke(): Promise<void> {
+  const states = new Map<string, { state: JobState; exitCode?: number | null }>([
+    ["job_x", { state: "running" }],
+    ["job_y", { state: "running" }],
+  ]);
+  const jobs = {
+    status: async (_sshId: string, jobId: string) => {
+      const entry = states.get(jobId);
+      if (entry === undefined) throw new Error(`missing job ${jobId}`);
+      return {
+        jobId,
+        state: entry.state,
+        ...(entry.exitCode !== undefined ? { exitCode: entry.exitCode } : {}),
+        jobDir: `/jobs/${jobId}`,
+        logPath: `/jobs/${jobId}/output.log`,
+      } as JobInfo;
+    },
+  } as unknown as JobService;
+  const manager = {
+    homeDir: async () => "/home/test",
+    exec: async (input: { command: string }) => {
+      if (input.command.startsWith("wc -c")) return fakeExecResult("0\n");
+      if (input.command.startsWith("tail -n")) return fakeExecResult("");
+      return fakeExecResult("");
+    },
+  } as unknown as ConnectionManager;
+  const notices: WatchNotice[] = [];
+  const service = new WatchService({
+    manager,
+    jobs,
+    intervalMs: 10,
+    maxIntervalMs: 30,
+    maxFailures: 3,
+    ttlMs: 60_000,
+    logScanBytes: 64 * 1024,
+    readyTimeoutMs: 5_000,
+    readyIntervalMs: 10,
+    readyStableMs: 0,
+    notify: async (notice) => {
+      notices.push(notice);
+    },
+  });
+  try {
+    const created = await service.createNotifier({
+      sessionID: "ses_disconnect",
+      mode: "all",
+      failFast: true,
+      notify: { logLines: 10, logScope: "failed" },
+      watchIds: [],
+      targets: [
+        { kind: "job", sshId: "ssh_a", jobId: "job_x", watchAfterReady: false },
+        { kind: "job", sshId: "ssh_b", jobId: "job_y", watchAfterReady: false },
+      ],
+    });
+    const canceled = service.cancelBySshId("ssh_a");
+    assert.deepEqual(canceled.canceledWatchIds, [created.watches[0]!.watchId]);
+    assert.deepEqual(canceled.closedNotifierIds, []);
+    assert.deepEqual(canceled.remainingNotifierIds, [
+      created.notifier.notifierId,
+    ]);
+    assert.equal(notices.length, 0);
+
+    const notifierView = service.list("ses_disconnect", {
+      notifierId: created.notifier.notifierId,
+    });
+    assert.deepEqual(notifierView.notifiers[0]?.watchIds, [
+      created.watches[1]!.watchId,
+    ]);
+    const canceledWatch = service.list("ses_disconnect", {
+      watchId: created.watches[0]!.watchId,
+    }).watches[0];
+    assert.equal(canceledWatch?.lifecycle, "canceled");
+    assert.equal(canceledWatch?.refCount, 0);
+    assert.match(canceledWatch?.lastMessage ?? "", /ssh_disconnect/);
+
+    states.set("job_y", { state: "finished", exitCode: 0 });
+    await waitFor(() => notices.length >= 1);
+    assert.equal(notices[0]?.event, "completed");
+    assert.deepEqual(
+      notices[0]?.targets.map((target) => target.watchId),
+      [created.watches[1]!.watchId],
+    );
+
+    const onlyHost = await service.createNotifier({
+      sessionID: "ses_disconnect",
+      mode: "all",
+      failFast: true,
+      notify: { logLines: 10, logScope: "failed" },
+      watchIds: [],
+      targets: [
+        { kind: "job", sshId: "ssh_a", jobId: "job_x", watchAfterReady: false },
+      ],
+    });
+    const closed = service.cancelBySshId("ssh_a");
+    assert.deepEqual(closed.closedNotifierIds, [
+      onlyHost.notifier.notifierId,
+    ]);
+    assert.equal(notices.length, 1);
+  } finally {
+    service.dispose();
+  }
+}
+
+
+async function runWatchJobStopSmoke(): Promise<void> {
+  const states = new Map<string, { state: JobState; exitCode?: number | null }>([
+    ["job_s", { state: "running" }],
+    ["job_t", { state: "running" }],
+  ]);
+  const jobs = {
+    status: async (_sshId: string, jobId: string) => {
+      const entry = states.get(jobId);
+      if (entry === undefined) throw new Error(`missing job ${jobId}`);
+      return {
+        jobId,
+        state: entry.state,
+        ...(entry.exitCode !== undefined ? { exitCode: entry.exitCode } : {}),
+        jobDir: `/jobs/${jobId}`,
+        logPath: `/jobs/${jobId}/output.log`,
+      } as JobInfo;
+    },
+  } as unknown as JobService;
+  const manager = {
+    homeDir: async () => "/home/test",
+    exec: async (input: { command: string }) => {
+      if (input.command.startsWith("wc -c")) return fakeExecResult("0\n");
+      if (input.command.startsWith("tail -n")) return fakeExecResult("");
+      return fakeExecResult("");
+    },
+  } as unknown as ConnectionManager;
+  const notices: WatchNotice[] = [];
+  const service = new WatchService({
+    manager,
+    jobs,
+    intervalMs: 10,
+    maxIntervalMs: 30,
+    maxFailures: 3,
+    ttlMs: 60_000,
+    logScanBytes: 64 * 1024,
+    readyTimeoutMs: 5_000,
+    readyIntervalMs: 10,
+    readyStableMs: 0,
+    notify: async (notice) => {
+      notices.push(notice);
+    },
+  });
+  try {
+    const created = await service.createNotifier({
+      sessionID: "ses_job_stop",
+      mode: "all",
+      failFast: true,
+      notify: { logLines: 10, logScope: "failed" },
+      watchIds: [],
+      targets: [
+        { kind: "job", sshId: "ssh_s", jobId: "job_s", watchAfterReady: false },
+        { kind: "job", sshId: "ssh_t", jobId: "job_t", watchAfterReady: false },
+      ],
+    });
+    const canceled = service.cancelByJob("ssh_s", "job_s");
+    assert.deepEqual(canceled.canceledWatchIds, [created.watches[0]!.watchId]);
+    assert.deepEqual(canceled.closedNotifierIds, []);
+    assert.deepEqual(canceled.remainingNotifierIds, [
+      created.notifier.notifierId,
+    ]);
+    assert.equal(notices.length, 0);
+    const canceledWatch = service.list("ses_job_stop", {
+      watchId: created.watches[0]!.watchId,
+    }).watches[0];
+    assert.equal(canceledWatch?.lifecycle, "canceled");
+    assert.equal(canceledWatch?.targetState, "stopped");
+    assert.match(canceledWatch?.lastMessage ?? "", /ssh_job_stop/);
+
+    const notifierView = service.list("ses_job_stop", {
+      notifierId: created.notifier.notifierId,
+    });
+    assert.deepEqual(notifierView.notifiers[0]?.watchIds, [
+      created.watches[1]!.watchId,
+    ]);
+
+    states.set("job_t", { state: "finished", exitCode: 0 });
+    await waitFor(() => notices.length >= 1);
+    assert.equal(notices[0]?.event, "completed");
+    assert.deepEqual(
+      notices[0]?.targets.map((target) => target.watchId),
+      [created.watches[1]!.watchId],
+    );
+
+    // The watch can also observe a stopped job directly; it must cancel
+    // silently instead of emitting a failed notice.
+    states.set("job_s", { state: "running" });
+    const observed = await service.createNotifier({
+      sessionID: "ses_job_stop",
+      mode: "all",
+      failFast: true,
+      notify: { logLines: 10, logScope: "failed" },
+      watchIds: [],
+      targets: [
+        { kind: "job", sshId: "ssh_s", jobId: "job_s", watchAfterReady: false },
+      ],
+    });
+    const watchedId = observed.watches[0]!.watchId;
+    states.set("job_s", { state: "stopped" });
+    await waitFor(
+      () =>
+        service.list("ses_job_stop", { watchId: watchedId }).watches[0]
+          ?.lifecycle === "canceled",
+    );
+    assert.equal(notices.length, 1);
+    const observedWatch = service.list("ses_job_stop", {
+      watchId: watchedId,
+    }).watches[0];
+    assert.equal(observedWatch?.targetState, "stopped");
+    assert.equal(
+      service.list("ses_job_stop", {
+        notifierId: observed.notifier.notifierId,
+      }).notifiers.length,
+      0,
+    );
+
+    // While ssh_job_stop is in flight, a transient lost state must not notify.
+    states.set("job_s", { state: "running" });
+    const suppressed = await service.createNotifier({
+      sessionID: "ses_job_stop",
+      mode: "all",
+      failFast: true,
+      notify: { logLines: 10, logScope: "failed" },
+      watchIds: [],
+      targets: [
+        { kind: "job", sshId: "ssh_s", jobId: "job_s", watchAfterReady: false },
+      ],
+    });
+    const suppressedWatchId = suppressed.watches[0]!.watchId;
+    service.beginJobStop("ssh_s", "job_s");
+    states.set("job_s", { state: "lost" });
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.equal(notices.length, 1);
+    const ended = service.endJobStop("ssh_s", "job_s", "stopped");
+    assert.deepEqual(ended.canceledWatchIds, [suppressedWatchId]);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(notices.length, 1);
+    const suppressedWatch = service.list("ses_job_stop", {
+      watchId: suppressedWatchId,
+    }).watches[0];
+    assert.equal(suppressedWatch?.lifecycle, "canceled");
+    assert.equal(suppressedWatch?.targetState, "stopped");
+  } finally {
+    service.dispose();
+  }
+}
+
+async function waitFor(predicate: () => boolean): Promise<void> {
+  const deadline = Date.now() + 3_000;
+  while (!predicate()) {
+    if (Date.now() > deadline) {
+      throw new Error("timed out waiting for watch notification");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
 
 function fakeExecResult(
   stdout: string,

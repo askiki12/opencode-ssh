@@ -102,6 +102,7 @@
 
 ## 已完成
 
+- 2026-11-24：watch / notifier：新增 `ssh_watch` / `ssh_unwatch` / `ssh_watch_list`；watch 只观察一个 job/process target，notifier 聚合多 target（`mode` / `fail_fast` / 超时）；支持跨主机、ready、success/failure、`watch_after_ready`、detached 复用和 session 级去重；只在内存中，不持久化。
 - 2026-11：7 个工具（connect / disconnect / list / exec / profile_add / profile_update / profile_remove / profile_list）实现完毕。
 - 2026-11：profile 迁移到 `ctx.storage`（SQLite），移除 `profiles.json`。
 - 2026-11：密码、私钥口令、sudo 密码使用 AES-256-GCM 加密；活跃连接和 sudo 密码仅保存在内存。

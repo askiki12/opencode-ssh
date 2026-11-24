@@ -33,6 +33,8 @@ src/ssh/manager.ts            持久连接池、连接/断开/执行、取消与
 src/ssh/files.ts              SFTP 文件读写、编辑、删除、传输
 src/ssh/search.ts             远端 glob/grep 与引擎回退
 src/ssh/jobs.ts               远端长任务注册表与进程组停止
+src/ssh/watch.ts              watch 状态机、notifier 聚合与通知
+src/ssh/watch-types.ts        watch / target / notifier 类型
 src/tools/definitions.ts      工具定义与返回格式化
 src/rpc.ts                    TUI 与 server 之间的 RPC 契约
 src/rpc-handlers.ts           RPC 实现（连接测试、profile 测试后再保存）
@@ -164,6 +166,8 @@ AGENTS.md                     Agent 使用约定（连接复用、profile、exec
 | 参数 | 类型 | 说明 |
 | --- | --- | --- |
 | `ssh_id` | string | `ssh_connect` 返回的连接 id |
+
+主动断开时会**静默取消**绑定在该 `ssh_id` 上的 watch，不发送 lost 通知。若一个 notifier 还监控其他连接，它只移除该连接上的 watch 并继续运行；如果移除后没有剩余 watch，notifier 静默关闭。意外断线不经过该工具，仍会重试并在达到 `watchMaxFailures` 后报告 lost。
 
 ### 2.3 `ssh_list`
 
@@ -372,6 +376,64 @@ sudo 示例（需要 profile 或连接上保存了 `sudo_password`）：
 - 在支持 `setsid` 的远端（大多数 Linux/BSD），job 的生命周期独立于工具调用和 SSH 连接；没有 `setsid`（例如基础 macOS）时只能尽力 detach，断开连接可能终止进程。取消 `ssh_exec` 不会停止 job；检测用 `ssh_job_status`，停止用 `ssh_job_stop`，不需要额外的 `job_kill`；
 - **只跟踪宿主机进程**：容器有独立生命周期。`docker run -d` 会立刻返回，`docker exec` 不随 job 停止，停止 job 也可能留下容器；是否继续或停止容器需另外决定（`docker ps` / `docker stop`）。
 
+### 2.10.1 watch 与通知
+
+job 工具负责启动、查询和停止远端任务；watch 只负责观察 target 并通知，不拥有 job/process 的生命周期。watch 是**对 target 的观察状态**，notifier 负责聚合多个 watch 并决定何时通知当前会话。两者都只存在于插件进程内存中，不跨 OpenCode 重启或插件重载保留。
+
+| 工具 | 用途 |
+| --- | --- |
+| `ssh_watch` | 创建 notifier；可以新建 `targets`、复用已有 `watch_ids`，或两者混合 |
+| `ssh_unwatch` | 传 `notifier_id` 关闭通知组并释放 watch；传 `watch_id` 销毁一个无引用的 detached/终态 watch |
+| `ssh_watch_list` | 无参列出当前 session 的 notifier 和 watch；可按 `notifier_id` 或 `watch_id` 过滤 |
+
+不支持 `notifier_id + watch_id` 的局部移除；要从通知组里去掉一个 target，关闭旧 notifier 后用剩余 `watch_ids` 新建 notifier。
+
+target：
+
+```jsonc
+// job：只需要 ssh_id + job_id；log_path/name 默认来自 job registry
+{ "kind": "job", "ssh_id": "ssh_a", "job_id": "job_1" }
+
+// process：agent 自己通过 ssh_exec 获取 pid/pid_file；regex 条件要求 log_path
+{ "kind": "process", "ssh_id": "ssh_b",
+  "pid_file": "/run/svc.pid", "log_path": "/var/log/svc.log" }
+```
+
+每个 target 自带 `ssh_id`，因此一个 notifier 可以同时观察多台主机。`log_path` / `pid_file` 必须是绝对路径或 `~/...`。
+
+常用参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `mode` | `all` 等全部 target 结束；`first` 第一个 target 结束就通知；默认 `all` |
+| `fail_fast` | 任一 target 失败/timeout/lost 立即通知；只停止 watch，不停止 job/process；默认 `true` |
+| `timeout_ms` | 整个 notifier 的超时；到期只关闭 watch |
+| `notify.log_scope` | `failed`（默认，只附失败 target 日志）/ `all` / `none` |
+| `notify.log_lines` | 每个被选中 target 最多附带的日志行数；默认 40，0 关闭 |
+| `ready` | 服务就绪条件：`command`（退出码 0）或 `regex`（日志匹配），支持 `timeout_ms` / `interval_ms` / `stable_ms` |
+| `success` / `failure` | job 的退出码、process 的日志 regex，或显式成功/失败标记；failure 优先 |
+| `watch_after_ready` | ready 后继续监控；服务退出或命中 failure 时再通知 |
+
+使用流程：
+
+1. `ssh_job_start` 只启动 job，不自动创建 watch；
+2. agent 显式调用 `ssh_watch({ targets: [...] })`；
+3. 需要多个 job 一起等待时，把它们放进同一个 `targets` 数组，使用 `mode: "all"` + `fail_fast: true`；
+4. `fail_fast` 触发后，通知里会给出 `remainingWatchIds`；它们已从该 notifier 释放（没有其他引用时变为 detached），可复用：
+   `ssh_watch({ watch_ids: ["watch_..."], mode: "all" })`；
+5. 同一 session 对同一 target 只能有一个 active/detached watch；参数完全相同时 `ssh_watch` 会复用已有 watch，参数不同则报错。不同 session 可以各自 watch 同一 job。
+
+状态与生命周期：
+
+- watch：`active` / `detached` / `completed` / `failed` / `timeout` / `canceled`；
+- notifier：`watching` / `completed` / `failed` / `timeout` / `canceled`；
+- `detached` 表示 notifier 引用归零、轮询暂停，`lastKnownTargetState` 可能过期；重新挂载后会立即重新查询；
+- 终态 watch 保留一段 TTL 供查询，不可复用；需要继续监控请新建 watch；
+- 主动 `ssh_disconnect` 会静默取消该 `ssh_id` 上的 watch，不发送 lost 通知；跨主机 notifier 的其他 watch 继续运行。意外断线仍会重试，达到 `watchMaxFailures` 后报告 lost；
+- `ssh_job_stop` 成功停止 job 时会静默取消该 `(ssh_id, job_id)` 的 watch，不发送通知；跨 target 的 notifier 只移除该 watch，其他 target 继续。watch 状态为 `canceled`、`targetState=stopped`；`ssh_job_status` 仍显示 job 的 `stopped`；
+- watch 的探测、日志读取和 `ready.command` 都以 SSH 登录用户执行，没有 `sudo` / `as_user`；需要特权探测时请在命令中自行处理或改用可访问的检查；
+- `ssh_watch_list` 只描述观察关系；job 的权威状态、退出码和日志仍看 `ssh_job_status`。
+
 ### 2.11 sudo 密码的已知限制
 
 **插件不会在保存 profile 或建立连接时校验 sudo 密码。**
@@ -438,6 +500,8 @@ inline 连接复用也会比较认证材料指纹和 host key policy：同一 `u
 
 `ssh_job_start` 和 `ssh_job_stop` 使用主机级粒度（与 `ssh_exec` 相同），`ssh_job_status` 不额外确认。
 
+`ssh_watch` 对每个 target 的 `ssh_id` 分别做主机级确认；`ssh_watch_list` 和 `ssh_unwatch` 只操作当前 session 的内存对象，不额外确认。
+
 读、glob、grep 不触发额外确认。
 
 权限拒绝仍然作为工具错误返回，不会被包装成 `ssh_exec` 的普通结果或执行 metadata；`errorCode` 等字段只描述 SSH 执行层的失败。
@@ -502,7 +566,12 @@ npm install
         "connectTimeoutMs": 20000,
         "execTimeoutMs": 120000,
         "keepaliveIntervalMs": 15000,
-        "hostKeyPolicy": "accept-new"
+        "hostKeyPolicy": "accept-new",
+        "watchIntervalMs": 5000,
+        "watchMaxIntervalMs": 60000,
+        "watchMaxFailures": 5,
+        "watchTtlMs": 1800000,
+        "watchReadyTimeoutMs": 1200000
       }
     }
   ]
@@ -518,6 +587,14 @@ npm install
 | `execTimeoutMs` | `120000` | 默认命令超时 |
 | `keepaliveIntervalMs` | `15000` | keepalive 间隔，0 禁用 |
 | `hostKeyPolicy` | `accept-new` | 默认主机指纹策略 |
+| `watchIntervalMs` | `5000` | watch 轮询间隔 |
+| `watchMaxIntervalMs` | `60000` | 探测失败时的最大退避间隔 |
+| `watchMaxFailures` | `5` | 连续探测失败多少次后标记 target lost |
+| `watchTtlMs` | `1800000` | detached/终态 watch 保留时长 |
+| `watchLogScanBytes` | `262144` | 每个 watch 单次扫描的最大日志字节数 |
+| `watchReadyTimeoutMs` | `1200000` | 服务 ready 默认超时 |
+| `watchReadyIntervalMs` | `5000` | ready 探测默认间隔 |
+| `watchReadyStableMs` | `5000` | ready 探测需稳定的时长 |
 
 ---
 

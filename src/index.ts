@@ -9,6 +9,7 @@ import { createRpcHandlers } from "./rpc-handlers.js";
 import { ConnectionManager } from "./ssh/manager.js";
 import { JobService } from "./ssh/jobs.js";
 import { SearchService } from "./ssh/search.js";
+import { formatWatchNotice, WatchService } from "./ssh/watch.js";
 import { createSshTools } from "./tools/definitions.js";
 
 export default Plugin.define({
@@ -26,6 +27,44 @@ export default Plugin.define({
     const manager = new ConnectionManager(config, profiles, knownHosts);
     const search = new SearchService(manager);
     const jobs = new JobService(manager);
+    const watches = new WatchService({
+      manager,
+      jobs,
+      intervalMs: config.watchIntervalMs,
+      maxIntervalMs: config.watchMaxIntervalMs,
+      maxFailures: config.watchMaxFailures,
+      ttlMs: config.watchTtlMs,
+      logScanBytes: config.watchLogScanBytes,
+      readyTimeoutMs: config.watchReadyTimeoutMs,
+      readyIntervalMs: config.watchReadyIntervalMs,
+      readyStableMs: config.watchReadyStableMs,
+      notify: async (notice) => {
+        await ctx.session.synthetic({
+          sessionID: notice.sessionID as never,
+          text: formatWatchNotice(notice),
+          description:
+            notice.event === "ready"
+              ? "SSH watch ready"
+              : notice.event === "timeout"
+                ? "SSH watch timeout"
+                : notice.event === "failed"
+                  ? "SSH watch failed"
+                  : notice.event === "canceled"
+                    ? "SSH watch canceled"
+                    : "SSH watch completed",
+          resume: true,
+          delivery: "queue",
+          metadata: {
+            source: "opencode-ssh",
+            notifierId: notice.notifierId,
+            watchIds: notice.targets.map((target) => target.watchId),
+            remainingWatchIds: notice.remainingWatchIds,
+            state: notice.state,
+            event: notice.event,
+          },
+        });
+      },
+    });
     const rpcRegistration = await ctx.rpc.register(
       SshRpc,
       createRpcHandlers({ manager, profiles }),
@@ -36,6 +75,7 @@ export default Plugin.define({
       config,
       search,
       jobs,
+      watches,
       assertPermission: async (request) => {
         await ctx.permission.assert({
           // The plugin tool context carries branded ids. They are strings at
@@ -66,6 +106,7 @@ export default Plugin.define({
 
     return async () => {
       try {
+        watches.dispose();
         await registration.dispose();
       } finally {
         try {

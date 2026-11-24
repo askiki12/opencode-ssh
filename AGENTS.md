@@ -95,6 +95,23 @@ Use the job tools when a task should outlive one tool call (training, builds, mi
 - Only the **host process** is tracked. Containers keep their own lifecycle: stopping a job may leave the container running, so decide separately whether to stop or keep it (`docker ps`, `docker stop`).
 - POSIX remotes only.
 
+## Watch notifications
+
+- `ssh_job_start` does not create a watch. Call `ssh_watch` explicitly when a notification is needed.
+- `ssh_watch` creates a notifier over one or more targets. Every target carries its own `ssh_id`, so one notifier can span hosts.
+- A job target needs only `ssh_id` and `job_id`; its log path and name default from the job registry. A process target needs `pid` or `pid_file`; use `log_path` for regex conditions or log tails. `log_path` and `pid_file` must be absolute or `~/...`.
+- Use `ready` (`command` or log `regex`) for service startup, `success` / `failure` for exit codes or explicit log markers, and `watch_after_ready: true` to keep watching after readiness.
+- `mode: "all"` waits for every target. `mode: "first"` notifies on the first terminal target. `fail_fast: true` notifies on the first failure but does not stop the targets.
+- On `fail_fast`, `mode: "first"`, or a notifier timeout, remaining watches are released from the notifier; they become `detached` when no other notifier references them. The notification includes `remainingWatchIds`; reuse them with `ssh_watch({ watch_ids: [...] })`.
+- `ssh_unwatch({ notifier_id })` closes the notifier and releases watches without destroying them. `ssh_unwatch({ watch_id })` destroys a detached or terminal watch only when it has no notifier references.
+- `ssh_watch_list()` lists notifiers and watches for the current session. Use `notifier_id` or `watch_id` to filter. `detached` means polling is paused; `lastKnownTargetState` may be stale.
+- Partial removal is not supported: to drop one target from a notifier, close it and create a new notifier from the remaining `watch_ids`.
+- Watches are in-memory only. A plugin restart drops them. `ssh_job_status` remains the authoritative source for job details and logs.
+- `ssh_disconnect` silently cancels watches bound to that ssh_id and sends no lost notification. A cross-host notifier keeps its remaining watches. Unexpected connection loss is different: those watches retry and then report lost after `watchMaxFailures`.
+- `ssh_job_stop` silently cancels watches for that `(ssh_id, job_id)` when the stop succeeds. The watch becomes `canceled` with `targetState=stopped`, and no notification is sent. Cross-target notifiers keep their remaining watches. `already-finished`, `not-running`, and `mismatch` do not cancel watches.
+- Do not use a process target for a job that already exited; process watches require a live pid/pid_file. Use a job target for completed work.
+- Watch probes, log reads, and `ready_command` run as the SSH login user; there is no `sudo` / `as_user`. Use a command the login user can run.
+
 ## Security
 
 - Do not put passwords, private key passphrases, or sudo passwords in user-facing summaries.

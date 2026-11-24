@@ -21,12 +21,25 @@ import type {
 } from "../ssh/manager.js";
 import { SshOperationError } from "../ssh/errors.js";
 import { InvalidGlobPatternError } from "../ssh/glob.js";
-import type { JobInfo, JobService } from "../ssh/jobs.js";
+import type { JobInfo, JobService, JobStopResult } from "../ssh/jobs.js";
 import type {
   GlobResult,
   GrepResult,
   SearchService,
 } from "../ssh/search.js";
+import type { WatchService } from "../ssh/watch.js";
+import {
+  formatTargetLabel,
+  type CreateNotifierResult,
+  type LogScope,
+  type MatchCondition,
+  type NotifierMode,
+  type NotifierSnapshot,
+  type ReadyCondition,
+  type WatchListResult,
+  type WatchSnapshot,
+  type WatchTargetSpec,
+} from "../ssh/watch-types.js";
 import { errorMessage } from "../util.js";
 
 export interface ExecuteContext {
@@ -54,6 +67,7 @@ export interface ToolDependencies {
   config: ResolvedConfig;
   search: SearchService;
   jobs: JobService;
+  watches: WatchService;
   assertPermission?: (request: SshPermissionRequest) => Promise<void>;
 }
 
@@ -454,7 +468,8 @@ const JOB_START_INPUT = {
     },
     name: {
       type: "string",
-      description: "Optional short label shown by ssh_job_status.",
+      description:
+        "Optional short label shown by ssh_job_status and by watch notifications.",
     },
     cwd: {
       type: "string",
@@ -503,6 +518,214 @@ const JOB_STOP_INPUT = {
     },
   },
   required: ["ssh_id", "job_id"],
+  additionalProperties: false,
+} as const;
+
+const WATCH_MATCH_SCHEMA = {
+  type: "object",
+  properties: {
+    exit_code: {
+      type: "integer",
+      description:
+        "Exit code that matches this condition. Job targets only; process targets must use regex.",
+    },
+    exit_codes: {
+      type: "array",
+      items: { type: "integer" },
+      description:
+        "Exit codes that match this condition. Job targets only; process targets must use regex.",
+    },
+    regex: {
+      type: "string",
+      description:
+        "Regular expression matched against newly appended log output. Failure takes precedence over success.",
+    },
+  },
+  additionalProperties: false,
+} as const;
+
+const WATCH_READY_SCHEMA = {
+  type: "object",
+  properties: {
+    command: {
+      type: "string",
+      description:
+        "Readiness probe command. Exit code 0 means ready. Use either command or regex.",
+    },
+    regex: {
+      type: "string",
+      description:
+        "Regular expression matched against the target log. Use either command or regex.",
+    },
+    timeout_ms: {
+      type: "integer",
+      minimum: 1_000,
+      maximum: 604_800_000,
+      description: "Readiness timeout in milliseconds (maximum 7 days).",
+    },
+    interval_ms: {
+      type: "integer",
+      minimum: 100,
+      maximum: 3_600_000,
+      description: "Readiness probe interval in milliseconds (maximum 1 hour).",
+    },
+    stable_ms: {
+      type: "integer",
+      minimum: 0,
+      maximum: 3_600_000,
+      description:
+        "How long a successful probe must stay successful before the target is ready (maximum 1 hour).",
+    },
+  },
+  additionalProperties: false,
+} as const;
+
+const WATCH_TARGET_SCHEMA = {
+  type: "object",
+  properties: {
+    kind: {
+      type: "string",
+      enum: ["job", "process"],
+      description:
+        "Target kind. job uses a job_id from ssh_job_start; process uses pid or pid_file.",
+    },
+    ssh_id: {
+      type: "string",
+      description:
+        "Connection id for this target. Every target carries its own ssh_id, so one notifier can combine targets from different hosts.",
+    },
+    job_id: {
+      type: "string",
+      description: "Job returned by ssh_job_start. Required when kind=job.",
+    },
+    pid: {
+      type: "integer",
+      minimum: 1,
+      description: "Process id. Use either pid or pid_file.",
+    },
+    pid_file: {
+      type: "string",
+      description:
+        "Remote file containing the process id. Use either pid or pid_file. Must be absolute or start with ~/.",
+    },
+    name: {
+      type: "string",
+      description: "Optional display name used in notifications and lists.",
+    },
+    log_path: {
+      type: "string",
+      description:
+        "Log file used for tail output and regex conditions. Job targets default to the job's output.log; process targets must provide it for regex conditions. Must be absolute or start with ~/.",
+    },
+    ready: WATCH_READY_SCHEMA,
+    success: WATCH_MATCH_SCHEMA,
+    failure: WATCH_MATCH_SCHEMA,
+    watch_after_ready: {
+      type: "boolean",
+      description:
+        "After a ready notification, keep watching until the service exits or matches a failure condition.",
+    },
+  },
+  required: ["kind", "ssh_id"],
+  additionalProperties: false,
+} as const;
+
+const WATCH_NOTIFY_SCHEMA = {
+  type: "object",
+  properties: {
+    title: {
+      type: "string",
+      description: "Optional title shown in notifications and lists.",
+    },
+    log_lines: {
+      type: "integer",
+      minimum: 0,
+      maximum: 500,
+      default: 40,
+      description:
+        "Maximum log tail lines per included target. 0 disables log tails.",
+    },
+    log_scope: {
+      type: "string",
+      enum: ["failed", "all", "none"],
+      default: "failed",
+      description:
+        "Which targets include log tails: failed/timed-out targets and the target that triggered a ready notification (default), all targets, or none.",
+    },
+  },
+  additionalProperties: false,
+} as const;
+
+const WATCH_INPUT = {
+  type: "object",
+  properties: {
+    targets: {
+      type: "array",
+      items: WATCH_TARGET_SCHEMA,
+      description:
+        "New targets to watch. Each target gets its own watch; the notifier groups them.",
+    },
+    watch_ids: {
+      type: "array",
+      items: { type: "string" },
+      description:
+        "Existing watches to reuse. Watches must belong to this session and must not be terminal.",
+    },
+    mode: {
+      type: "string",
+      enum: ["all", "first"],
+      default: "all",
+      description:
+        "all waits for every target; first notifies on the first terminal target.",
+    },
+    fail_fast: {
+      type: "boolean",
+      default: true,
+      description:
+        "Notify immediately on the first failure, timeout, or lost target. This stops the watch, not the targets.",
+    },
+    timeout_ms: {
+      type: "integer",
+      minimum: 1_000,
+      maximum: 604_800_000,
+      description:
+        "Optional deadline for the whole notifier, maximum 7 days. On timeout the watch closes but targets keep running.",
+    },
+    notify: WATCH_NOTIFY_SCHEMA,
+  },
+  additionalProperties: false,
+} as const;
+
+const WATCH_UNWATCH_INPUT = {
+  type: "object",
+  properties: {
+    notifier_id: {
+      type: "string",
+      description:
+        "Notifier to close. Its watches are released, not destroyed, and may be reused.",
+    },
+    watch_id: {
+      type: "string",
+      description:
+        "Detached or terminal watch to destroy. It must have no notifier references (refCount=0).",
+    },
+  },
+  additionalProperties: false,
+} as const;
+
+const WATCH_LIST_INPUT = {
+  type: "object",
+  properties: {
+    notifier_id: {
+      type: "string",
+      description: "Show one notifier and its watches.",
+    },
+    watch_id: {
+      type: "string",
+      description:
+        "Show one watch, including its attachedNotifierIds and last known observation state.",
+    },
+  },
   additionalProperties: false,
 } as const;
 
@@ -695,20 +918,50 @@ export function createSshTools(
 
     {
       name: "disconnect",
-      description: "Close an active persistent SSH connection by ssh_id.",
+      description:
+        "Close an active persistent SSH connection by ssh_id. " +
+        "Watches bound to this ssh_id are canceled silently: no lost notification is sent. " +
+        "A notifier that also watches other connections keeps running with its remaining watches. " +
+        "Unexpected connection loss is different: those watches retry and may later report lost.",
       input: DISCONNECT_INPUT,
       options: { namespace: "ssh", codemode: true },
       execute: async (raw) => {
         const input = asRecord(raw);
         const sshId = requireString(input.ssh_id, "ssh_id");
+        // Validate before canceling watches, so a bad ssh_id cannot silently
+        // discard observation state.
+        dependencies.manager.getInfo(sshId);
+        const canceled = dependencies.watches.cancelBySshId(sshId);
         const info = await dependencies.manager.disconnect(sshId);
+        const lines = [
+          "SSH connection closed.",
+          `ssh_id: ${info.id}`,
+          `target: ${info.user}@${info.host}:${info.port}`,
+        ];
+        if (canceled.canceledWatchIds.length > 0) {
+          lines.push(
+            `canceled watches: ${canceled.canceledWatchIds.length} (no lost notifications were sent)`,
+            ...canceled.canceledWatchIds.map((watchId) => `- ${watchId}`),
+          );
+        }
+        if (canceled.closedNotifierIds.length > 0) {
+          lines.push(
+            `closed notifiers: ${canceled.closedNotifierIds.join(", ")}`,
+          );
+        }
+        if (canceled.remainingNotifierIds.length > 0) {
+          lines.push(
+            `notifiers still watching other connections: ${canceled.remainingNotifierIds.join(", ")}`,
+          );
+        }
         return {
-          content: [
-            "SSH connection closed.",
-            `ssh_id: ${info.id}`,
-            `target: ${info.user}@${info.host}:${info.port}`,
-          ].join("\n"),
-          metadata: { sshId: info.id },
+          content: lines.join("\n"),
+          metadata: {
+            sshId: info.id,
+            watchesCanceled: canceled.canceledWatchIds,
+            notifiersClosed: canceled.closedNotifierIds,
+            notifiersRemaining: canceled.remainingNotifierIds,
+          },
         };
       },
     },
@@ -760,7 +1013,7 @@ export function createSshTools(
       description:
         "Execute a command over a persistent SSH connection. Returns the exit code, stdout, and stderr. " +
         "Use an ssh_id from ssh_connect or ssh_list; prefer reusing an existing connection instead of connecting again. " +
-        "For long-running foreground work, prefer ssh_job_start (survival across disconnect depends on the remote having setsid); use ssh_exec for short commands or work you explicitly detach and manage yourself. " +
+        "For long-running foreground work, prefer ssh_job_start (survival across disconnect depends on the remote having setsid); use ssh_exec for short commands or work you explicitly detach. To be notified about a detached process, use ssh_watch with a process target. " +
         "Each call opens a new channel, so shell state such as cd/export does not persist; use cwd and env instead. " +
         "tty=true allocates a PTY but does not provide interactive stdin; stdin closes immediately, so use it for TTY detection/color, not for prompts. " +
         "Background processes inherit the SSH channel's stdout/stderr; if they outlive this call they can hit EPIPE/SIGPIPE or SIGHUP. Redirect stdin/stdout/stderr and detach, or use ssh_job_start. " +
@@ -1381,12 +1634,13 @@ export function createSshTools(
       name: "job_start",
       description:
         "Start a long-running remote command detached from the SSH channel and return a job_id. " +
+        "This tool only starts and reports the job: it does not create a watch or send notifications. Call ssh_watch explicitly for notifications, ssh_job_status for authoritative state and logs, and ssh_job_stop to terminate. " +
         "Use this for tasks that outlive one tool call instead of raising ssh_exec timeout_ms; it runs as the SSH login user and has no sudo/as_user options or stored sudo password. " +
         "On hosts with setsid (most Linux/BSD) it survives disconnect/OpenCode restarts; without setsid (for example base macOS) detachment is best-effort. " +
-        "Run a foreground command. Scripts that fan out and wait (for example `&` + `wait`) are fine. Avoid commands that return immediately and leave detached work behind (for example `nohup cmd &`): the job tracks only the launcher; use ssh_exec for those. " +
+        "Run a foreground command. Scripts that fan out and wait (for example `&` + `wait`) are fine. Avoid commands that return immediately and leave detached work behind (for example `nohup cmd &`): the job tracks only the launcher; use ssh_exec for those, then watch the resulting process if needed. " +
         "Only the host process is tracked; containers keep their own lifecycle. " +
-        "Cancelling this call does not stop the job; with setsid, disconnecting does not either. Use ssh_job_stop to terminate it. " +
-        "Inspect with ssh_job_status and clean up with ssh_remove on job_dir. POSIX remotes only.",
+        "Cancelling this call does not stop the job; with setsid, disconnecting does not either. " +
+        "Clean up with ssh_remove on job_dir after the logs are no longer needed. POSIX remotes only.",
       input: JOB_START_INPUT,
       options: { namespace: "ssh", codemode: true },
       execute: async (raw, context) => {
@@ -1423,10 +1677,11 @@ export function createSshTools(
     {
       name: "job_status",
       description:
-        "Check a job started by ssh_job_start, or list the 100 most recent jobs when job_id is omitted. " +
+        "Read the authoritative state of a job started by ssh_job_start, or list the 100 most recent jobs when job_id is omitted. " +
+        "This reads the remote job registry only; it does not create or cancel watches and does not show notification subscriptions. A watch being detached or canceled does not change job state. Use ssh_watch_list for watch/notifier state. " +
         "States: starting, running, finished (has exit_code), stopped (terminated by ssh_job_stop), lost (process gone or the pid no longer belongs to the job), corrupt (missing or invalid meta.json). " +
-        "Pass log_lines to include the tail of output.log. " +
-        "Finished jobs keep their logs until you remove their job_dir with ssh_remove.",
+        "Pass log_lines to include the tail of output.log. Finished jobs keep their logs until you remove their job_dir with ssh_remove. " +
+        "After reconnecting, use the new ssh_id with the same job_id; job state and logs live on the remote host.",
       input: JOB_STATUS_INPUT,
       options: { namespace: "ssh", codemode: true },
       execute: async (raw) => {
@@ -1465,7 +1720,9 @@ export function createSshTools(
         "Kills the whole process group when available. Refuses to signal a pid whose command line " +
         "does not belong to the job, which protects against pid reuse. " +
         "Only the host process is tracked; containers keep their own lifecycle and are not stopped. " +
-        "Finished jobs are reported without doing anything. This is the job termination tool; no separate job_kill is needed.",
+        "A successful stop silently cancels watches for this (ssh_id, job_id): no failed notification is sent, and the watch becomes canceled with targetState=stopped. Notifiers that also watch other targets keep running. " +
+        "already-finished, not-running, and mismatch are reported without side effects and do not cancel watches. " +
+        "Use ssh_job_status to confirm the stopped state. This is the job termination tool; no separate job_kill is needed.",
       input: JOB_STOP_INPUT,
       options: { namespace: "ssh", codemode: true },
       execute: async (raw, context) => {
@@ -1473,16 +1730,51 @@ export function createSshTools(
         const sshId = requireString(input.ssh_id, "ssh_id");
         await assertHostPermission(dependencies, context, sshId);
 
-        const result = await dependencies.jobs.stop(
+        const jobId = requireString(input.job_id, "job_id");
+        dependencies.watches.beginJobStop(sshId, jobId);
+        let result: JobStopResult;
+        try {
+          result = await dependencies.jobs.stop(sshId, jobId);
+        } catch (error) {
+          dependencies.watches.endJobStop(sshId, jobId, "aborted");
+          throw error;
+        }
+        const canceled = dependencies.watches.endJobStop(
           sshId,
-          requireString(input.job_id, "job_id"),
+          jobId,
+          result.outcome,
         );
 
         const lines: string[] = [];
         switch (result.outcome) {
-          case "stopped":
+          case "stopped": {
             lines.push(`Stopped job ${result.jobId} (pid ${result.pid}).`);
-            break;
+            if (canceled.canceledWatchIds.length > 0) {
+              lines.push(
+                `canceled watches: ${canceled.canceledWatchIds.length} (no notification was sent)`,
+                ...canceled.canceledWatchIds.map((watchId) => `- ${watchId}`),
+              );
+            }
+            if (canceled.closedNotifierIds.length > 0) {
+              lines.push(
+                `closed notifiers: ${canceled.closedNotifierIds.join(", ")}`,
+              );
+            }
+            if (canceled.remainingNotifierIds.length > 0) {
+              lines.push(
+                `notifiers still watching other targets: ${canceled.remainingNotifierIds.join(", ")}`,
+              );
+            }
+            return {
+              content: lines.join("\n"),
+              metadata: {
+                ...result,
+                watchesCanceled: canceled.canceledWatchIds,
+                notifiersClosed: canceled.closedNotifierIds,
+                notifiersRemaining: canceled.remainingNotifierIds,
+              },
+            };
+          }
           case "already-finished":
             lines.push(
               `Job ${result.jobId} already finished with exit code ${result.exitCode}.`,
@@ -1501,7 +1793,185 @@ export function createSshTools(
         }
         return {
           content: lines.join("\n"),
+          metadata: {
+            ...result,
+            watchesCanceled: canceled.canceledWatchIds,
+            notifiersClosed: canceled.closedNotifierIds,
+            notifiersRemaining: canceled.remainingNotifierIds,
+          },
+        };
+      },
+    },
+
+    {
+      name: "watch",
+      description:
+        "Observe one or more existing targets and notify this session. A watch never starts, stops, or changes a job/process: use ssh_job_start/ssh_exec for lifecycle, ssh_job_stop to terminate, and ssh_job_status for authoritative job state. " +
+        "Pass targets to create watches, watch_ids to reuse existing watches, or both. Existing watches keep their original conditions. One notifier can combine targets from different hosts. Job targets default log path and name from the job registry; process targets require a live pid/pid_file. Regex conditions need an available log: explicit log_path, or the job's default output.log. " +
+        "A session has at most one non-terminal watch per target: identical conditions reuse it, different conditions are rejected. Terminal watches are history and are not reused; create a new watch instead. Different sessions may create independent watches for the same target, but they share the SSH connection. " +
+        "Use ready for service startup, success/failure for exit codes or log markers, and watch_after_ready=true to continue after readiness. mode=all waits for every target; mode=first closes on the first terminal target. fail_fast and timeout_ms only close the watch; they never stop targets. " +
+        "Watches are in-memory and a plugin restart drops them. An intentional ssh_disconnect silently cancels all watches on that ssh_id; a successful ssh_job_stop does the same for that job. Unexpected connection loss is retried and may later report lost. Use ssh_watch_list to inspect the resulting watchers and notifier state.",
+      input: WATCH_INPUT,
+      options: { namespace: "ssh", codemode: true },
+      execute: async (raw, context) => {
+        const input = asRecord(raw);
+        let parsed: {
+          targets: WatchTargetSpec[];
+          watchIds: string[];
+          mode: NotifierMode;
+          failFast: boolean;
+          timeoutMs?: number;
+          notify: { title?: string; logLines: number; logScope: LogScope };
+        };
+        try {
+          parsed = parseWatchInput(input, dependencies.config);
+        } catch (error) {
+          throw toToolError(error, "SSH_INVALID_INPUT");
+        }
+
+        const watchSshIds = new Set(
+          parsed.targets.map((target) => target.sshId),
+        );
+        for (const watchId of parsed.watchIds) {
+          const listed = dependencies.watches.list(context.sessionID, {
+            watchId,
+          });
+          const watch = listed.watches[0];
+          if (watch !== undefined) watchSshIds.add(watch.sshId);
+        }
+        for (const sshId of watchSshIds) {
+          await assertHostPermission(dependencies, context, sshId);
+        }
+
+        let result: CreateNotifierResult;
+        try {
+          result = await dependencies.watches.createNotifier({
+            sessionID: context.sessionID,
+            agent: context.agent,
+            targets: parsed.targets,
+            watchIds: parsed.watchIds,
+            mode: parsed.mode,
+            failFast: parsed.failFast,
+            ...(parsed.timeoutMs !== undefined
+              ? { timeoutMs: parsed.timeoutMs }
+              : {}),
+            notify: parsed.notify,
+          });
+        } catch (error) {
+          throw error instanceof SshOperationError
+            ? toToolError(error)
+            : toToolError(error, "SSH_INVALID_INPUT");
+        }
+
+        return {
+          content: formatNotifierCreated(result),
+          metadata: {
+            notifierId: result.notifier.notifierId,
+            watchIds: result.notifier.watchIds,
+            state: result.notifier.state,
+            reusedWatchIds: result.reusedWatchIds,
+          },
+        };
+      },
+    },
+
+    {
+      name: "unwatch",
+      description:
+        "Close a notifier or destroy a watch. Pass exactly one of notifier_id or watch_id. " +
+        "With notifier_id, only the notification group is removed; its watches are released but not destroyed. refCount drops, and non-terminal watches become detached, paused, and reusable with ssh_watch watch_ids. A watch shared by another notifier stays active. " +
+        "With watch_id, the watch is destroyed immediately, but only when refCount=0 and it is detached or terminal; an active or still-referenced watch is rejected. " +
+        "Neither form stops a job or process, and neither sends a notification. Partial removal is not supported: to drop one target, close the notifier and create a new one with the remaining watch_ids.",
+      input: WATCH_UNWATCH_INPUT,
+      options: { namespace: "ssh", codemode: true },
+      execute: async (raw, context) => {
+        const input = asRecord(raw);
+        let notifierId: string | undefined;
+        let watchId: string | undefined;
+        try {
+          notifierId = optionalString(input.notifier_id);
+          watchId = optionalString(input.watch_id);
+          if ((notifierId === undefined) === (watchId === undefined)) {
+            throw new Error("Pass exactly one of notifier_id or watch_id.");
+          }
+        } catch (error) {
+          throw toToolError(error, "SSH_INVALID_INPUT");
+        }
+
+        if (notifierId !== undefined) {
+          const result = dependencies.watches.unwatchNotifier(
+            context.sessionID,
+            notifierId,
+          );
+          return {
+            content: result.removed
+              ? [
+                  `Notifier closed: ${notifierId}`,
+                  `released watches: ${result.releasedWatchIds.join(", ") || "(none)"}`,
+                  result.detachedWatchIds.length > 0
+                    ? `detached and reusable: ${result.detachedWatchIds.join(", ")}`
+                    : "No watches were detached.",
+                ].join("\n")
+              : `No active notifier found: ${notifierId}`,
+            metadata: { ...result, notifierId },
+          };
+        }
+
+        let result: { removed: boolean; watchId: string };
+        try {
+          result = dependencies.watches.destroyWatch(
+            context.sessionID,
+            watchId as string,
+          );
+        } catch (error) {
+          throw toToolError(error, "SSH_INVALID_INPUT");
+        }
+        return {
+          content: result.removed
+            ? `Watch destroyed: ${result.watchId}`
+            : `No detached watch found: ${result.watchId}`,
           metadata: { ...result },
+        };
+      },
+    },
+
+    {
+      name: "watch_list",
+      description:
+        "Show in-memory watch and notifier metadata for this session. This is not a remote job query: it returns no job logs, and targetState is only the last known observation snapshot, which can be stale while detached. Use ssh_job_status for authoritative job state, exit code, and logs. " +
+        "With no filters, returns live notifiers and all watches, including detached, completed, failed, timeout, and canceled watches. notifier_id returns one live notifier and its watches; watch_id returns one watch and its attachedNotifierIds. Filters are mutually exclusive. " +
+        "Only live watching notifiers are listed; closed notifiers are removed. Terminal and detached watches remain until TTL cleanup. Process targets have no ssh_job_status equivalent, so this is their observation-state view.",
+      input: WATCH_LIST_INPUT,
+      options: { namespace: "ssh", codemode: true },
+      execute: async (raw, context) => {
+        const input = asRecord(raw);
+        let notifierId: string | undefined;
+        let watchId: string | undefined;
+        try {
+          notifierId = optionalString(input.notifier_id);
+          watchId = optionalString(input.watch_id);
+          if (notifierId !== undefined && watchId !== undefined) {
+            throw new Error("Use either notifier_id or watch_id, not both.");
+          }
+        } catch (error) {
+          throw toToolError(error, "SSH_INVALID_INPUT");
+        }
+
+        const result = dependencies.watches.list(context.sessionID, {
+          ...(notifierId !== undefined ? { notifierId } : {}),
+          ...(watchId !== undefined ? { watchId } : {}),
+        });
+        return {
+          content: formatWatchList(result, {
+            ...(notifierId !== undefined ? { notifierId } : {}),
+            ...(watchId !== undefined ? { watchId } : {}),
+          }),
+          metadata: {
+            notifierCount: result.notifiers.length,
+            watchCount: result.watches.length,
+            notifierId,
+            watchId,
+          },
         };
       },
     },
@@ -1933,6 +2403,489 @@ function formatJobList(jobs: JobInfo[]): string {
   return lines.join("\n");
 }
 
+function parseWatchInput(
+  input: Record<string, unknown>,
+  config: ResolvedConfig,
+): {
+  targets: WatchTargetSpec[];
+  watchIds: string[];
+  mode: NotifierMode;
+  failFast: boolean;
+  timeoutMs?: number;
+  notify: { title?: string; logLines: number; logScope: LogScope };
+} {
+  const targets = parseWatchTargets(input.targets, config);
+  const watchIds = parseStringArray(input.watch_ids, "watch_ids");
+  if (targets.length === 0 && watchIds.length === 0) {
+    throw new Error("ssh_watch requires at least one target or watch_id.");
+  }
+
+  const mode =
+    input.mode === undefined
+      ? "all"
+      : input.mode === "all" || input.mode === "first"
+        ? input.mode
+        : (() => {
+            throw new Error("mode must be all or first.");
+          })();
+  const failFast =
+    input.fail_fast === undefined
+      ? true
+      : requireBoolean(input.fail_fast, "fail_fast");
+  const timeoutMs =
+    input.timeout_ms === undefined
+      ? undefined
+      : requirePositiveInteger(input.timeout_ms, "timeout_ms");
+  if (timeoutMs !== undefined && timeoutMs > 7 * 24 * 60 * 60 * 1000) {
+    throw new Error("timeout_ms must not exceed 7 days.");
+  }
+  const notify = parseWatchNotify(input.notify);
+
+  return {
+    targets,
+    watchIds,
+    mode,
+    failFast,
+    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+    notify,
+  };
+}
+
+function parseWatchTargets(
+  value: unknown,
+  config: ResolvedConfig,
+): WatchTargetSpec[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) {
+    throw new Error("targets must be an array.");
+  }
+  return value.map((entry, index) => parseWatchTarget(entry, index, config));
+}
+
+function parseWatchTarget(
+  value: unknown,
+  index: number,
+  config: ResolvedConfig,
+): WatchTargetSpec {
+  const field = `targets[${index}]`;
+  let record: Record<string, unknown>;
+  try {
+    record = asRecord(value);
+  } catch {
+    throw new Error(`${field} must be an object.`);
+  }
+
+  const kind = requireString(record.kind, `${field}.kind`);
+  if (kind !== "job" && kind !== "process") {
+    throw new Error(`${field}.kind must be job or process.`);
+  }
+  const sshId = requireString(record.ssh_id, `${field}.ssh_id`);
+  const name = optionalString(record.name);
+  const logPath = optionalRemotePath(record.log_path, `${field}.log_path`);
+  const ready =
+    record.ready === undefined
+      ? undefined
+      : parseWatchReady(record.ready, `${field}.ready`, config);
+  const success =
+    record.success === undefined
+      ? undefined
+      : parseWatchMatch(
+          record.success,
+          `${field}.success`,
+          kind === "process",
+        );
+  const failure =
+    record.failure === undefined
+      ? undefined
+      : parseWatchMatch(
+          record.failure,
+          `${field}.failure`,
+          kind === "process",
+        );
+  const watchAfterReady =
+    record.watch_after_ready === undefined
+      ? false
+      : requireBoolean(
+          record.watch_after_ready,
+          `${field}.watch_after_ready`,
+        );
+  if (watchAfterReady && ready === undefined) {
+    throw new Error(
+      `${field}.watch_after_ready requires ${field}.ready.`,
+    );
+  }
+  if (
+    kind === "process" &&
+    logPath === undefined &&
+    hasLogRegex(ready, success, failure)
+  ) {
+    throw new Error(
+      `${field}.log_path is required for ready.regex or success/failure regex on a process target.`,
+    );
+  }
+
+  if (kind === "job") {
+    if (record.pid !== undefined || record.pid_file !== undefined) {
+      throw new Error(
+        `${field} is a job target; pid and pid_file are only valid for process targets.`,
+      );
+    }
+    const jobId = requireString(record.job_id, `${field}.job_id`);
+    return {
+      kind,
+      sshId,
+      jobId,
+      ...(name !== undefined ? { name } : {}),
+      ...(logPath !== undefined ? { logPath } : {}),
+      ...(ready !== undefined ? { ready } : {}),
+      ...(success !== undefined ? { success } : {}),
+      ...(failure !== undefined ? { failure } : {}),
+      watchAfterReady,
+    };
+  }
+
+  if (record.job_id !== undefined) {
+    throw new Error(
+      `${field} is a process target; job_id is only valid for job targets.`,
+    );
+  }
+  const pid =
+    record.pid === undefined
+      ? undefined
+      : requirePositiveInteger(record.pid, `${field}.pid`);
+  const pidFile = optionalRemotePath(record.pid_file, `${field}.pid_file`);
+  if ((pid === undefined) === (pidFile === undefined)) {
+    throw new Error(
+      `${field} requires exactly one of pid or pid_file for a process target.`,
+    );
+  }
+  return {
+    kind,
+    sshId,
+    ...(pid !== undefined ? { pid } : {}),
+    ...(pidFile !== undefined ? { pidFile } : {}),
+    ...(name !== undefined ? { name } : {}),
+    ...(logPath !== undefined ? { logPath } : {}),
+    ...(ready !== undefined ? { ready } : {}),
+    ...(success !== undefined ? { success } : {}),
+    ...(failure !== undefined ? { failure } : {}),
+    watchAfterReady,
+  };
+}
+
+function parseWatchReady(
+  value: unknown,
+  field: string,
+  config: ResolvedConfig,
+): ReadyCondition {
+  let record: Record<string, unknown>;
+  try {
+    record = asRecord(value);
+  } catch {
+    throw new Error(`${field} must be an object.`);
+  }
+  const command = optionalString(record.command);
+  const regex = optionalString(record.regex);
+  if ((command === undefined) === (regex === undefined)) {
+    throw new Error(`${field} requires exactly one of command or regex.`);
+  }
+  if (regex !== undefined) compileRegex(regex, `${field}.regex`);
+  const timeoutMs =
+    record.timeout_ms === undefined
+      ? config.watchReadyTimeoutMs
+      : requirePositiveInteger(record.timeout_ms, `${field}.timeout_ms`);
+  const intervalMs =
+    record.interval_ms === undefined
+      ? config.watchReadyIntervalMs
+      : requirePositiveInteger(record.interval_ms, `${field}.interval_ms`);
+  const stableMs =
+    record.stable_ms === undefined
+      ? config.watchReadyStableMs
+      : requireNonNegativeInteger(record.stable_ms, `${field}.stable_ms`);
+  if (timeoutMs > 7 * 24 * 60 * 60 * 1000) {
+    throw new Error(`${field}.timeout_ms must not exceed 7 days.`);
+  }
+  if (intervalMs > 60 * 60 * 1000) {
+    throw new Error(`${field}.interval_ms must not exceed 1 hour.`);
+  }
+  if (stableMs > 60 * 60 * 1000) {
+    throw new Error(`${field}.stable_ms must not exceed 1 hour.`);
+  }
+  return {
+    ...(command !== undefined ? { command } : {}),
+    ...(regex !== undefined ? { regex } : {}),
+    timeoutMs,
+    intervalMs,
+    stableMs,
+  };
+}
+
+function parseWatchMatch(
+  value: unknown,
+  field: string,
+  processTarget: boolean,
+): MatchCondition {
+  let record: Record<string, unknown>;
+  try {
+    record = asRecord(value);
+  } catch {
+    throw new Error(`${field} must be an object.`);
+  }
+  const exitCodes: number[] = [];
+  if (record.exit_code !== undefined) {
+    exitCodes.push(requireInteger(record.exit_code, `${field}.exit_code`));
+  }
+  if (record.exit_codes !== undefined) {
+    if (!Array.isArray(record.exit_codes)) {
+      throw new Error(`${field}.exit_codes must be an array.`);
+    }
+    for (let index = 0; index < record.exit_codes.length; index += 1) {
+      exitCodes.push(
+        requireInteger(
+          record.exit_codes[index],
+          `${field}.exit_codes[${index}]`,
+        ),
+      );
+    }
+  }
+  const regex = optionalString(record.regex);
+  if (regex !== undefined) compileRegex(regex, `${field}.regex`);
+  if (exitCodes.length === 0 && regex === undefined) {
+    throw new Error(
+      `${field} requires exit_code, exit_codes, or regex.`,
+    );
+  }
+  if (processTarget && exitCodes.length > 0) {
+    throw new Error(
+      `${field} cannot use exit_code or exit_codes on a process target; use regex.`,
+    );
+  }
+  return {
+    ...(exitCodes.length > 0 ? { exitCodes: [...new Set(exitCodes)] } : {}),
+    ...(regex !== undefined ? { regex } : {}),
+  };
+}
+
+function parseWatchNotify(
+  value: unknown,
+): { title?: string; logLines: number; logScope: LogScope } {
+  if (value === undefined) {
+    return { logLines: 40, logScope: "failed" };
+  }
+  let record: Record<string, unknown>;
+  try {
+    record = asRecord(value);
+  } catch {
+    throw new Error("notify must be an object.");
+  }
+  const title = optionalString(record.title);
+  const logLines =
+    record.log_lines === undefined
+      ? 40
+      : requireInteger(record.log_lines, "notify.log_lines");
+  if (logLines < 0 || logLines > 500) {
+    throw new Error("notify.log_lines must be between 0 and 500.");
+  }
+  const logScope =
+    record.log_scope === undefined
+      ? "failed"
+      : record.log_scope === "failed" ||
+          record.log_scope === "all" ||
+          record.log_scope === "none"
+        ? record.log_scope
+        : (() => {
+            throw new Error("notify.log_scope must be failed, all, or none.");
+          })();
+  return {
+    ...(title !== undefined ? { title } : {}),
+    logLines,
+    logScope,
+  };
+}
+
+function optionalRemotePath(
+  value: unknown,
+  field: string,
+): string | undefined {
+  const path = optionalString(value);
+  if (path === undefined) return undefined;
+  if (!path.startsWith("/") && !needsRemoteHome(path)) {
+    throw new Error(`${field} must be absolute or start with "~/".`);
+  }
+  return path;
+}
+
+function parseStringArray(value: unknown, field: string): string[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) {
+    throw new Error(`${field} must be an array.`);
+  }
+  return value.map((entry, index) =>
+    requireString(entry, `${field}[${index}]`),
+  );
+}
+
+function hasLogRegex(
+  ready: ReadyCondition | undefined,
+  success: MatchCondition | undefined,
+  failure: MatchCondition | undefined,
+): boolean {
+  return (
+    ready?.regex !== undefined ||
+    success?.regex !== undefined ||
+    failure?.regex !== undefined
+  );
+}
+
+function compileRegex(value: string, field: string): void {
+  try {
+    new RegExp(value);
+  } catch (error) {
+    throw new Error(`Invalid ${field}: ${errorMessage(error)}`);
+  }
+}
+
+function formatNotifierCreated(result: CreateNotifierResult): string {
+  const lines = [
+    `Notifier created: ${result.notifier.notifierId}`,
+    `state: ${result.notifier.state}`,
+    `mode: ${result.notifier.mode}  fail_fast: ${result.notifier.failFast}`,
+    `watches: ${result.notifier.watchIds.join(", ")}`,
+  ];
+  if (result.reusedWatchIds.length > 0) {
+    lines.push(`reused: ${result.reusedWatchIds.join(", ")}`);
+  }
+  lines.push("", "watch state:");
+  for (const watch of result.watches) {
+    lines.push(formatWatchLine(watch));
+  }
+  lines.push(
+    "",
+    "The watch is in-memory. Use ssh_watch_list to inspect it and ssh_unwatch to close the notifier.",
+  );
+  return lines.join("\n");
+}
+
+function formatWatchList(
+  result: WatchListResult,
+  filter: { notifierId?: string; watchId?: string },
+): string {
+  if (filter.watchId !== undefined) {
+    const watch = result.watches[0];
+    return watch === undefined
+      ? `No watch found: ${filter.watchId}`
+      : formatWatchDetail(watch);
+  }
+  if (filter.notifierId !== undefined) {
+    const notifier = result.notifiers[0];
+    if (notifier === undefined) {
+      return `No notifier found: ${filter.notifierId}`;
+    }
+    const lines = [
+      formatNotifierLine(notifier),
+      "",
+      `watches (${result.watches.length}):`,
+      ...result.watches.map((watch) => formatWatchLine(watch)),
+    ];
+    return lines.join("\n");
+  }
+
+  if (result.notifiers.length === 0 && result.watches.length === 0) {
+    return "No watch notifiers or watches.";
+  }
+  const lines = [
+    `notifiers (${result.notifiers.length}):`,
+    ...(result.notifiers.length === 0
+      ? ["(none)"]
+      : result.notifiers.map((notifier) => formatNotifierLine(notifier))),
+    "",
+    `watches (${result.watches.length}):`,
+    ...(result.watches.length === 0
+      ? ["(none)"]
+      : result.watches.map((watch) => formatWatchLine(watch))),
+  ];
+  return lines.join("\n");
+}
+
+function formatNotifierLine(notifier: NotifierSnapshot): string {
+  const bits = [
+    `- ${notifier.notifierId}`,
+    `state=${notifier.state}`,
+    `mode=${notifier.mode}`,
+    `fail_fast=${notifier.failFast}`,
+  ];
+  if (notifier.title !== undefined) bits.push(`title=${notifier.title}`);
+  bits.push(`watches=${notifier.watchIds.join(",") || "(none)"}`);
+  return bits.join("  ");
+}
+
+function formatWatchLine(watch: WatchSnapshot): string {
+  const targetState =
+    watch.lifecycle === "detached"
+      ? `last_known=${watch.targetState}`
+      : `target=${watch.targetState}`;
+  const bits = [
+    `- ${watch.watchId}`,
+    formatTargetLabel(watch),
+    `lifecycle=${watch.lifecycle}`,
+    targetState,
+    `refs=${watch.refCount}`,
+  ];
+  if (watch.name !== undefined) bits.push(`name=${watch.name}`);
+  if (watch.exitCode !== undefined) bits.push(`exit=${watch.exitCode}`);
+  if (watch.lastEvent !== undefined) bits.push(`event=${watch.lastEvent}`);
+  if (watch.lastError !== undefined) bits.push(`error=${watch.lastError}`);
+  if (watch.attachedNotifierIds.length > 0) {
+    bits.push(`notifiers=${watch.attachedNotifierIds.join(",")}`);
+  }
+  if (watch.lifecycle === "detached") {
+    bits.push(`last_checked=${watch.lastCheckedAt ?? "never"}`);
+  }
+  return bits.join("  ");
+}
+
+function formatWatchDetail(watch: WatchSnapshot): string {
+  const lines = [
+    `watch: ${watch.watchId}`,
+    `target: ${formatTargetLabel(watch)}`,
+    `kind: ${watch.kind}`,
+    `ssh_id: ${watch.sshId}`,
+    ...(watch.jobId !== undefined ? [`job_id: ${watch.jobId}`] : []),
+    ...(watch.pid !== undefined ? [`pid: ${watch.pid}`] : []),
+    ...(watch.pidFile !== undefined ? [`pid_file: ${watch.pidFile}`] : []),
+    ...(watch.name !== undefined ? [`name: ${watch.name}`] : []),
+    `lifecycle: ${watch.lifecycle}`,
+    `last_known_target_state: ${watch.targetState}`,
+    `ref_count: ${watch.refCount}`,
+    `notifiers: ${watch.attachedNotifierIds.join(", ") || "(none)"}`,
+    `created_at: ${new Date(watch.createdAt).toISOString()}`,
+    ...(watch.lastCheckedAt !== undefined
+      ? [`last_checked_at: ${new Date(watch.lastCheckedAt).toISOString()}`]
+      : []),
+    ...(watch.lastEvent !== undefined ? [`last_event: ${watch.lastEvent}`] : []),
+    ...(watch.lastMessage !== undefined
+      ? [`last_message: ${watch.lastMessage}`]
+      : []),
+    ...(watch.lastError !== undefined ? [`last_error: ${watch.lastError}`] : []),
+    ...(watch.exitCode !== undefined ? [`exit_code: ${watch.exitCode}`] : []),
+    ...(watch.logPath !== undefined ? [`log_path: ${watch.logPath}`] : []),
+    ...(watch.readyAt !== undefined
+      ? [`ready_at: ${new Date(watch.readyAt).toISOString()}`]
+      : []),
+    ...(watch.terminalAt !== undefined
+      ? [`terminal_at: ${new Date(watch.terminalAt).toISOString()}`]
+      : []),
+    ...(watch.detachedAt !== undefined
+      ? [`detached_at: ${new Date(watch.detachedAt).toISOString()}`]
+      : []),
+    "",
+    watch.lifecycle === "detached"
+      ? "This watch is detached and paused. last_known_target_state may be stale; reattach it with ssh_watch watch_ids to refresh."
+      : "This is observation state. Use ssh_job_status for authoritative job details.",
+  ];
+  return lines.join("\n");
+}
+
 function formatReadResult(result: ReadRemoteFileResult): string {
   const lines = [
     `path: ${result.path}`,
@@ -2072,6 +3025,22 @@ function requireInteger(value: unknown, field: string): number {
     throw new Error(`${field} must be an integer.`);
   }
   return value;
+}
+
+function requirePositiveInteger(value: unknown, field: string): number {
+  const result = requireInteger(value, field);
+  if (result <= 0) {
+    throw new Error(`${field} must be greater than zero.`);
+  }
+  return result;
+}
+
+function requireNonNegativeInteger(value: unknown, field: string): number {
+  const result = requireInteger(value, field);
+  if (result < 0) {
+    throw new Error(`${field} must be zero or greater.`);
+  }
+  return result;
 }
 
 function requireBoolean(value: unknown, field: string): boolean {
